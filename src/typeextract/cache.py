@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -36,9 +37,13 @@ class MemoryCache:
             return value
 
     def set(self, key: str, value: dict[str, Any]) -> None:
+        self.set_many([(key, value)])
+
+    def set_many(self, items: Iterable[tuple[str, dict[str, Any]]]) -> None:
         with self._lock:
-            self._data[key] = value
-            self._data.move_to_end(key)
+            for key, value in items:
+                self._data[key] = value
+                self._data.move_to_end(key)
             while len(self._data) > self.max_items:
                 self._data.popitem(last=False)
 
@@ -66,11 +71,14 @@ class SQLiteCache:
         return json.loads(row[0]) if row else None
 
     def set(self, key: str, value: dict[str, Any]) -> None:
+        self.set_many([(key, value)])
+
+    def set_many(self, items: Iterable[tuple[str, dict[str, Any]]]) -> None:
+        """One transaction for a whole response (a commit per answer costs ~0.3 ms each)."""
+        now = time.time()
+        rows = [(key, json.dumps(value), now) for key, value in items]
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO answers (key, value, created) VALUES (?, ?, ?)",
-                (key, json.dumps(value), time.time()),
-            )
+            self._conn.executemany("INSERT OR REPLACE INTO answers (key, value, created) VALUES (?, ?, ?)", rows)
             self._conn.commit()
 
     def close(self) -> None:

@@ -112,3 +112,35 @@ def test_budget_blocks_requests_and_tracks_cost():
     assert m.cost_usd == pytest.approx(0.042) and budget.spent == pytest.approx(0.042)
     with pytest.raises(BudgetExceededError):
         ask(Asker(Recorder(), "jev", budget=Budget(max_usd=0.0, price_per_mtok=0.042)), qs(1))
+
+
+def test_question_limit_rejection_lowers_only_the_question_limit():
+    import httpx
+
+    from typeextract.jev import status_error
+
+    class Capped(Recorder):
+        async def evaluate(self, state, questions, model):
+            if len(questions) > 40:
+                body = {"detail": [{"msg": "too many questions in one request (at most 40 questions)"}]}
+                raise status_error(422, body, httpx.Headers())
+            return await super().evaluate(state, questions, model)
+
+    asker = Asker(Capped(), "jev", budget=Budget(None, 0.042))
+    tokens_before = asker._request_tokens
+    answers, m = ask(asker, qs(100))
+    assert len(answers) == 100 and m.splits == 1
+    assert asker._max_questions == 40 and asker._request_tokens == tokens_before  # tokens untouched
+
+
+def test_token_limit_rejection_never_starves_a_single_question():
+    class TokenCapped(Recorder):
+        async def evaluate(self, state, questions, model):
+            if len(questions) > 5:
+                raise RequestTooLargeError("request exceeds context length", 400)
+            return await super().evaluate(state, questions, model)
+
+    asker = Asker(TokenCapped(), "jev", budget=Budget(None, 0.042))
+    answers, _ = ask(asker, qs(20), state="s" * 3000)
+    assert len(answers) == 20
+    assert asker._request_tokens >= 1000 + 10  # never below what one question with this state needs

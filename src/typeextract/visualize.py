@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import html
 import json
 from pathlib import Path
@@ -34,14 +35,23 @@ def to_html(doc: AnnotatedDocument, title: str | None = None) -> str:
     classes = sorted({e.extraction_class for e in [*spans, *doc.sentence_labels]})
     color = _colors(classes)
 
-    # innermost (shortest) span wins at every character
+    # innermost (shortest) span wins at every character: sweep the boundaries with a heap of
+    # the spans open at each point, O(N log N) instead of rescanning every span per segment
     bounds = sorted({0, len(text), *(e.start for e in spans), *(e.end for e in spans)})
+    by_start = sorted(range(len(spans)), key=lambda k: spans[k].start)
+    open_spans: list[tuple[int, int]] = []  # (length, index)
+    nxt = 0
     body = []
     for a, b in zip(bounds, bounds[1:]):
-        covering = [e for e in spans if e.start <= a and b <= e.end]
+        while nxt < len(by_start) and spans[by_start[nxt]].start <= a:
+            k = by_start[nxt]
+            heapq.heappush(open_spans, (spans[k].end - spans[k].start, k))
+            nxt += 1
+        while open_spans and spans[open_spans[0][1]].end <= a:  # lazily drop spans that ended
+            heapq.heappop(open_spans)
         chunk = html.escape(text[a:b])
-        if covering:
-            e = min(covering, key=lambda x: x.end - x.start)
+        if open_spans:
+            e = spans[open_spans[0][1]]
             style = f"background:{color[e.extraction_class]}33;border-bottom:2px solid {color[e.extraction_class]}"
             if e.needs_review:
                 style += ";outline:1px dashed #999"

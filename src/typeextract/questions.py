@@ -39,9 +39,6 @@ class Answer:
     noul: float | None = None
     score: float | None = None
 
-    def p(self, option: str) -> float:
-        return float(self.probabilities.get(option, 0.0))
-
     def top2(self) -> tuple[str | None, float, float]:
         ranked = sorted(self.probabilities.items(), key=lambda kv: kv[1], reverse=True)
         if not ranked:
@@ -162,6 +159,8 @@ class ChoiceTask:
             raise ValueError(f"ChoiceTask {self.key!r} has no options")
         if self.escape and self.escape[0] in self.options:
             raise ValueError(f"option {self.escape[0]!r} collides with the escape option")
+        if self.max_options - (1 if self.escape else 0) < 2:
+            raise ValueError("max_options leaves fewer than 2 options per group; the tournament could not finish")
         self._round = self._groups(list(self.options))
 
     def _groups(self, keys: list[str]) -> list[list[str]]:

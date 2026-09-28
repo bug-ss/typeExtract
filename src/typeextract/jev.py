@@ -119,6 +119,24 @@ _TOO_LARGE_RE = re.compile(
 )
 
 
+_STATED_LIMIT_RE = re.compile(
+    r"(?:at most|maximum(?: of)?|max(?:imum)?|limit(?: is| of)?|up to)\s*:?\s*(\d[\d,]*)", re.IGNORECASE
+)
+
+
+def _too_large(msg: str, status: int, rid: str | None) -> RequestTooLargeError:
+    """Classify which limit a rejection names, and the value it states, from the message."""
+    err = RequestTooLargeError(msg, status, rid)
+    if re.search(r"question", msg, re.IGNORECASE):
+        err.limit_kind = "questions"
+    elif status == 413 or re.search(r"token|context|length|payload|size", msg, re.IGNORECASE):
+        err.limit_kind = "tokens"
+    m = _STATED_LIMIT_RE.search(msg)
+    if m:
+        err.limit = int(m.group(1).replace(",", ""))
+    return err
+
+
 def _message(body: Any) -> str:
     if isinstance(body, str):
         return body[:300]
@@ -170,7 +188,7 @@ def status_error(status: int, body: Any, headers: httpx.Headers) -> APIError:
     if status in (401, 403):
         return AuthenticationError(msg, status, rid)
     if status == 413 or (status in (400, 422) and _TOO_LARGE_RE.search(msg)):
-        return RequestTooLargeError(msg, status, rid)
+        return _too_large(msg, status, rid)
     if status in (400, 404, 422):
         return InvalidRequestError(msg, status, rid)
     if status == 429:

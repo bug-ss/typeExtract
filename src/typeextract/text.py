@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import re
+import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -11,8 +12,46 @@ from dataclasses import dataclass, field
 # These scripts do not separate words with spaces, so each character is a token.
 CJK = "぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ"
 _WORD = f"[^\\W_{CJK}]"
-TOKEN_RE = re.compile(f"[{CJK}]|{_WORD}+(?:[.,'’\\-/&]{_WORD}+)*")
+
+
+def _mark_ranges() -> str:
+    """Combining marks (and ZWNJ/ZWJ) as a regex class body. Python's ``\\w`` excludes them, which
+    would split Devanagari, Bengali, Thai, Hebrew/Arabic with points, or a decomposed "Müller"."""
+    cps = [0x200C, 0x200D]
+    for lo, hi in ((0x0300, 0x1FFF), (0x20D0, 0x20FF), (0xFE00, 0xFE0F), (0xFE20, 0xFE2F)):
+        cps += [cp for cp in range(lo, hi + 1) if unicodedata.category(chr(cp)).startswith("M")]
+    cps.sort()
+    out, start, prev = [], cps[0], cps[0]
+    for cp in cps[1:] + [-1]:
+        if cp != prev + 1:
+            out.append(f"\\u{start:04x}" + (f"-\\u{prev:04x}" if prev != start else ""))
+            start = cp
+        prev = cp
+    return "".join(out)
+
+
+_MARKS = _mark_ranges()
+_WORDC = f"(?:{_WORD}|[{_MARKS}])"  # a word character or a combining mark
+# A token is one CJK character, or a word that may contain inner . , ' - / & ("1,200.50", "O'Neil",
+# "AT&T"). A trailing possessive 's is consumed but kept out of the token: "Apple's" -> "Apple".
+TOKEN_RE = re.compile(
+    f"([{CJK}]|{_WORD}{_WORDC}*(?:(?![\'’][sS](?!{_WORDC}))[.,\'’\\-/&]{_WORD}{_WORDC}*)*)"
+    f"(?:[\'’][sS](?!{_WORDC}))?"
+)
 _CJK_RE = re.compile(f"[{CJK}]")
+
+
+def tokens(text: str, start: int = 0, end: int | None = None) -> list[tuple[int, int]]:
+    """Word tokens fully inside ``text[start:end]``, as offsets."""
+    end = len(text) if end is None else end
+    out = []
+    for m in TOKEN_RE.finditer(text, start):
+        s, e = m.span(1)
+        if e > end:
+            break
+        out.append((s, e))
+    return out
+
 
 # --------------------------------------------------------------------------- stopwords
 
@@ -47,6 +86,12 @@ _CORP_SUFFIXES = frozenset(
 _CONNECTORS = frozenset(
     "of de da do dos das del della di du la le van von der den y e and & for the".split()
 )
+
+
+def keeps_period(word: str) -> bool:
+    """Whether a following "." belongs to the word: "Inc.", "Ltd.", "Dr.", "U.S." (not a full stop)."""
+    w = word.lower()
+    return w in _CORP_SUFFIXES or w in _NEVER_FINAL or ("." in w and w.replace(".", "").isalpha())
 
 # --------------------------------------------------------------------------- patterns
 
@@ -115,6 +160,35 @@ class _Cover:
     def strictly_contains(self, s: int, e: int) -> bool:
         i = bisect.bisect_right(self.starts, s) - 1
         return i >= 0 and self.ends[i] >= e and (s, e) not in self.exact
+
+
+_STRUCTURAL = frozenset({"date", "time", "phone", "identifier", "email", "url"})
+
+
+def typed_spans(text: str, kinds: Collection[str] | None = None) -> list[tuple[int, int, str]]:
+    """Matches of the built-in patterns as ``(start, end, kind)``, with the kind rules applied.
+
+    A phone needs 7-15 digits. A bare number (or phone-looking digit run) inside a structured
+    value (a date, time, phone, ID, email or URL) is never a number of its own: "2026" in a date,
+    "415" in a phone. When proposing candidates (``kinds=None``) a number inside money, a
+    percentage or a quantity is dropped too, since the whole value is proposed; asking for
+    ``kinds={"number"}`` keeps it ("40" in "40 units").
+    """
+    found: list[tuple[int, int, str]] = []
+    for kind, p in BUILTIN_PATTERNS.items():
+        for s, e in _pattern_spans(p, text):
+            if kind == "phone" and not 7 <= sum(c.isdigit() for c in text[s:e]) <= 15:
+                continue
+            found.append((s, e, kind))
+    strict = kinds is None
+    covers = {
+        weak: _Cover(
+            [(s, e) for s, e, k in found if _rank(k) > _WEAK_KINDS.index(weak) and (strict or k in _STRUCTURAL)]
+        )
+        for weak in _WEAK_KINDS
+    }
+    out = [(s, e, k) for s, e, k in found if not (k in _WEAK_KINDS and covers[k].strictly_contains(s, e))]
+    return sorted(sp for sp in out if kinds is None or sp[2] in kinds)
 
 
 def _pattern_spans(pattern: re.Pattern[str], text: str) -> Iterable[tuple[int, int]]:
@@ -302,10 +376,8 @@ class Candidate:
     text: str
     sentence: int
     sources: set[str] = field(default_factory=set)
-    kinds: set[str] = field(default_factory=set)
-    """Built-in pattern kinds that matched exactly this span."""
-    classes: set[str] = field(default_factory=set)
-    """Entity ids whose own pattern, gazetteer or a custom generator proposed this span."""
+    """Who proposed the span: ``typed:money``, ``pattern:<class>``, ``gazetteer:<class>``,
+    ``custom[:<class>]``, ``proper_noun``, ``ngram``, ``jev_tagger``."""
     priority: int = 9
 
 
@@ -326,16 +398,7 @@ class _Collector:
             return None
         return i
 
-    def add(
-        self,
-        s: int,
-        e: int,
-        source: str,
-        priority: int,
-        kind: str | None = None,
-        cls: str | None = None,
-        sentence: int | None = None,
-    ) -> None:
+    def add(self, s: int, e: int, source: str, priority: int, sentence: int | None = None) -> None:
         s, e = _strip(self.text, s, e)
         if e <= s:
             return
@@ -348,10 +411,11 @@ class _Collector:
             self.found[i][(s, e)] = cand
         cand.sources.add(source)
         cand.priority = min(cand.priority, priority)
-        if kind:
-            cand.kinds.add(kind)
-        if cls:
-            cand.classes.add(cls)
+
+    def ranked(self, i: int, cap: int) -> list[Candidate]:
+        """Sentence ``i``'s candidates: the ``cap`` highest-priority ones, in text order."""
+        best = sorted(self.found[i].values(), key=lambda c: (c.priority, c.start, c.end))[:cap]
+        return sorted(best, key=lambda c: (c.start, c.end))
 
 
 def _gazetteer_re(terms: Iterable[str]) -> re.Pattern[str] | None:
@@ -359,6 +423,22 @@ def _gazetteer_re(terms: Iterable[str]) -> re.Pattern[str] | None:
     if not words:
         return None
     return re.compile(r"(?<!\w)(?:" + "|".join(re.escape(w) for w in words) + r")(?!\w)", re.IGNORECASE)
+
+
+def sentence_tokens(text: str, sentences: Sequence[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Tokens of each sentence (a token cut by a forced sentence split belongs to neither side)."""
+    toks = tokens(text)
+    starts = [s for s, _ in toks]
+    out = []
+    for ss, se in sentences:
+        lo, hi = bisect.bisect_left(starts, ss), bisect.bisect_left(starts, se)
+        out.append([t for t in toks[lo:hi] if t[1] <= se])
+    return out
+
+
+def cap_for(text: str, toks: Sequence[tuple[int, int]], max_per_sentence: int) -> int:
+    """Scripts without spaces produce many more character windows per sentence."""
+    return max_per_sentence * 3 if any(_CJK_RE.match(text[s:e]) for s, e in toks) else max_per_sentence
 
 
 def generate_candidates(
@@ -372,6 +452,7 @@ def generate_candidates(
     max_cjk_chars: int = 6,
     max_per_sentence: int = 60,
     builtin: bool = True,
+    proper_nouns: bool = True,
     ngrams: bool = True,
     custom: Sequence[CustomGenerator] = (),
 ) -> list[list[Candidate]]:
@@ -379,6 +460,7 @@ def generate_candidates(
 
     Priority: class-specific patterns, gazetteers and custom generators (0), typed patterns (1),
     proper-noun runs (2), plain numbers (3), n-grams with a capitalised word (4), other n-grams (5+n).
+    ``proper_nouns`` and ``ngrams`` are the heuristic generators; the others are precise.
     """
     col = _Collector(text, sentences)
     stop = {w.lower() for w in stopwords}
@@ -387,57 +469,31 @@ def generate_candidates(
     for cls, patterns in (class_patterns or {}).items():
         for p in patterns:
             for s, e in _pattern_spans(p, text):
-                col.add(s, e, f"pattern:{cls}", 0, cls=cls)
+                col.add(s, e, f"pattern:{cls}", 0)
     for cls, terms in (gazetteers or {}).items():
         gz = _gazetteer_re(terms)
         if gz is not None:
             for m in gz.finditer(text):
-                col.add(m.start(), m.end(), f"gazetteer:{cls}", 0, cls=cls)
+                col.add(m.start(), m.end(), f"gazetteer:{cls}", 0)
     for i, (ss, se) in enumerate(sentences):
         for gen in custom:
             for item in gen(text, ss, se):
                 s, e = int(item[0]), int(item[1])
                 if ss <= s < e <= se:
-                    col.add(s, e, "custom", 0, cls=item[2] if len(item) > 2 else None, sentence=i)
+                    col.add(s, e, f"custom:{item[2]}" if len(item) > 2 and item[2] else "custom", 0, sentence=i)
 
-    # typed patterns
     if builtin:
-        typed: list[tuple[int, int, str]] = []
-        for kind, p in BUILTIN_PATTERNS.items():
-            for s, e in _pattern_spans(p, text):
-                if kind == "phone" and not 7 <= sum(c.isdigit() for c in text[s:e]) <= 15:
-                    continue
-                typed.append((s, e, kind))
-        # A bare number (or a phone-looking digit run) inside a more specific match is noise.
-        covers = {
-            weak: _Cover([(s, e) for s, e, k in typed if _rank(k) > _WEAK_KINDS.index(weak)])
-            for weak in _WEAK_KINDS
-        }
-        for s, e, kind in typed:
-            if kind in _WEAK_KINDS and covers[kind].strictly_contains(s, e):
-                continue
-            col.add(s, e, f"pattern:{kind}", 3 if kind == "number" else 1, kind=kind)
+        for s, e, kind in typed_spans(text):
+            col.add(s, e, f"typed:{kind}", 3 if kind == "number" else 1)
 
-    # token-based proposals
-    tokens = [m.span() for m in TOKEN_RE.finditer(text)]
-    tok_starts = [s for s, _ in tokens]
     caps = []
-    for i, (ss, se) in enumerate(sentences):
-        lo = bisect.bisect_left(tok_starts, ss)
-        hi = bisect.bisect_left(tok_starts, se)
-        toks = [t for t in tokens[lo:hi] if t[1] <= se]
-        _proper_nouns(text, toks, stop, col, i)
+    for i, toks in enumerate(sentence_tokens(text, sentences)):
+        if proper_nouns:
+            _proper_nouns(text, toks, stop, col, i)
         if ngrams:
             _ngrams(text, toks, stop, col, i, max_ngram, max_cjk_chars)
-        # scripts without spaces produce many more character windows per sentence
-        has_cjk = any(_CJK_RE.match(text[s:e]) for s, e in toks)
-        caps.append(max_per_sentence * 3 if has_cjk else max_per_sentence)
-
-    out = []
-    for found, cap in zip(col.found, caps):
-        ranked = sorted(found.values(), key=lambda c: (c.priority, c.start, c.end))
-        out.append(sorted(ranked[:cap], key=lambda c: (c.start, c.end)))
-    return out
+        caps.append(cap_for(text, toks, max_per_sentence))
+    return [col.ranked(i, cap) for i, cap in enumerate(caps)]
 
 
 def _is_cjk(tok: str) -> bool:
@@ -476,7 +532,7 @@ def _proper_nouns(
             return
         s, e = toks[a][0], toks[b][1]
         col.add(s, e, "proper_noun", 2, sentence=sentence)
-        if e < len(text) and text[e] == "." and words[b].lower() in _CORP_SUFFIXES | _NEVER_FINAL:
+        if text[e : e + 1] == "." and keeps_period(words[b]):
             col.add(s, e + 1, "proper_noun", 2, sentence=sentence)
 
     i = 0
@@ -526,6 +582,7 @@ def _ngrams(
     sentence: int,
     max_ngram: int,
     max_cjk_chars: int,
+    source: str = "ngram",
 ) -> None:
     words = [text[s:e] for s, e in toks]
     n_toks = len(toks)
@@ -553,13 +610,111 @@ def _ngrams(
             if not cjk and all(t.replace(",", "").replace(".", "").isdigit() for t in span):
                 continue
             has_cap = not cjk and any(_is_cap(t) for t in span)
-            col.add(toks[i][0], toks[j][1], "ngram", 4 if has_cap else 5 + n, sentence=sentence)
+            col.add(toks[i][0], toks[j][1], source, 4 if has_cap else 5 + n, sentence=sentence)
+
+
+_REGION_GAP = re.compile(r"\s*[^\w\s;!?]{0,3}\s*")  # "Paris, London", "R$ 180", "bob@acme.com"
+_LEAD_SYMBOLS = frozenset("$€£¥₹₩#@")
+_TRAIL_SYMBOLS = frozenset("%‰°")
+
+
+def region_candidates(
+    text: str,
+    sentence: int,
+    sentence_span: tuple[int, int],
+    toks: Sequence[tuple[int, int]],
+    inside: Sequence[bool],
+    col: _Collector,
+    stop: Collection[str],
+    max_ngram: int = 4,
+    max_cjk_chars: int = 6,
+) -> None:
+    """Turn per-word "is this word part of a mention?" answers into candidate spans.
+
+    Consecutive tagged words form a *region*: they may be separated by a little punctuation
+    ("Paris, London", "R$ 180", "bob@acme.com"), and one untagged connector between two tagged
+    words is absorbed ("Bank of America"). A region is only where mentions are, not a mention:
+    it proposes itself (with an attached "$"/"#"/"@" or "%", and an abbreviation's period) and
+    every n-gram inside it, so lists ("Paris", "London") and nested mentions ("America" inside
+    "Bank of America") remain separable. Round 1 then decides which span is which type.
+    """
+    ss, se = sentence_span
+    stop = {w.lower() for w in stop}
+    n = len(toks)
+
+    def gap(a: int, b: int) -> str:
+        return text[toks[a][1] : toks[b][0]]
+
+    i = 0
+    while i < n:
+        if not inside[i]:
+            i += 1
+            continue
+        j = i
+        while True:
+            k = j + 1
+            if (
+                k + 1 < n
+                and not inside[k]
+                and inside[k + 1]
+                and text[toks[k][0] : toks[k][1]].lower() in _CONNECTORS
+                and _joinable_gap(gap(j, k))
+                and _joinable_gap(gap(k, k + 1))
+            ):
+                j = k + 1
+            elif k < n and inside[k] and _REGION_GAP.fullmatch(gap(j, k)):
+                j = k
+            else:
+                break
+        raw_s, raw_e = toks[i][0], toks[j][1]
+        s, e = raw_s, raw_e
+        while s > ss and text[s - 1] in _LEAD_SYMBOLS:
+            s -= 1
+        while e < se and text[e] in _TRAIL_SYMBOLS:
+            e += 1
+        for a, b in {(s, e), (raw_s, raw_e)}:
+            col.add(a, b, "jev_tagger", 0, sentence=sentence)
+        if text[e : e + 1] == "." and keeps_period(text[toks[j][0] : toks[j][1]]):
+            col.add(s, e + 1, "jev_tagger", 0, sentence=sentence)
+        _ngrams(text, list(toks[i : j + 1]), stop, col, sentence, max_ngram, max_cjk_chars, "jev_tagger")
+        i = j + 1
+
+
+_LATIN_WORDC_RE = re.compile(f"(?:[^\\W_{CJK}]|[{_MARKS}])")  # a spaced-script word char or mark
+
+
+def find_occurrences(text: str, span: str, start: int = 0, end: int | None = None) -> list[int]:
+    """Start offsets of ``span`` in ``text[start:end]`` as a whole word: "a" does not occur inside
+    "man", but CJK text (no spaces) is matched as a plain substring."""
+    if not span:
+        return []
+    end = len(text) if end is None else end
+    check_before = _LATIN_WORDC_RE.match(span[0]) is not None
+    check_after = _LATIN_WORDC_RE.match(span[-1]) is not None
+    out = []
+    at = text.find(span, start, end)
+    while at != -1:
+        after = at + len(span)
+        if not (check_before and at > 0 and _LATIN_WORDC_RE.match(text, at - 1)) and not (
+            check_after and after < end and _LATIN_WORDC_RE.match(text, after)
+        ):
+            out.append(at)
+        at = text.find(span, at + 1, end)
+    return out
 
 
 def find_spans(text: str, patterns: Sequence[re.Pattern[str]]) -> list[tuple[int, int]]:
     """All matches of ``patterns`` in ``text`` (group 1 if present), de-duplicated, in order."""
     spans = {sp for p in patterns for sp in _pattern_spans(p, text)}
     return sorted(spans)
+
+
+ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+
+
+def ordinal(n: int) -> str:
+    """0 -> "first" ... 9 -> "tenth", then "#11", "#12", ..."""
+    return ORDINALS[n] if n < len(ORDINALS) else f"#{n + 1}"
 
 
 def snippet(text: str, start: int, end: int, width: int = 40) -> str:

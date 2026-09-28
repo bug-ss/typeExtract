@@ -52,7 +52,14 @@ class AuthenticationError(APIError):
 
 
 class RequestTooLargeError(APIError):
-    """The request exceeds a server limit (tokens, questions, payload). Split and retry."""
+    """The request exceeds a server limit. Split and retry.
+
+    ``limit_kind`` is ``"questions"``, ``"tokens"`` or ``None`` (the message did not say) and
+    ``limit`` the number the server stated, if any, so only the right packing limit is lowered.
+    """
+
+    limit_kind: str | None = None
+    limit: int | None = None
 
 
 class InvalidRequestError(APIError):
