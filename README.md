@@ -67,6 +67,18 @@ Python 3.10+. The only runtime dependency is `httpx`.
 6. **Fields** (single-valued slots): the field's candidates become the options of one `Choice`,
    *"which option is the contract value?"*, plus a `Noul` asking whether the text states it at all.
 
+### Who finds the spans: `span_source`
+
+| `span_source` | How candidates are found | Use when |
+|---|---|---|
+| `"rules"` (default) | The code heuristics above | Most documents; cheapest |
+| `"jev"` | Jev tags every word ("which entity type is this word part of, or none?"); runs of words with the same type become candidates | Entities the rules can't anticipate: long lowercase phrases, citations with punctuation, other languages |
+| `"hybrid"` | Both, merged | Best recall; highest cost |
+
+In every mode, the candidates then go through the same classification and verification rounds.
+`"jev"` and `"hybrid"` add one round trip per window and one question per word (a 1,000-word
+document is roughly 1,000 extra questions).
+
 [docs/DESIGN.md](docs/DESIGN.md) has the full design and how each Jev limitation is handled.
 
 ## Handling Jev's limitations

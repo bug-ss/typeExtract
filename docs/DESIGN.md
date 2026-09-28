@@ -37,6 +37,11 @@ text ─► segment ─► windows ─► candidates ─► round 1: classify �
    - custom generators (a hook for spaCy, GLiNER or anything else).
 
    Candidates are de-duplicated by offsets and capped per sentence by priority.
+
+   With `span_source="jev"`, Jev finds the spans instead. It gets one `Choice` per word: *which
+   entity type is this word part of, or `none`?*. Runs of words with the same type (allowing
+   `&`, `-`, `/`, `.`, `,` between them) become candidates. `"hybrid"` merges both sources.
+   Either way, the candidates still go through rounds 1 and 2.
 4. **Round 1: classify.** For every candidate there is one `Choice`: *which entity type is this
    exact span a complete mention of, or `none`?* A second set of questions, one `Noul` per
    sentence and sentence label, asks *is this sentence an X?*. All of a window's questions go

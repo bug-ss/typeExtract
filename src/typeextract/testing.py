@@ -105,6 +105,15 @@ class FakeBackend:
             sentence = self._sentence(state, instr)
             subs = self.sentence_labels.get(instr["sentence_type"], [])
             return self._noul(any(s in sentence for s in subs))
+        if "word" in instr:  # span tagging: which entity type is this word part of?
+            sentence = self._sentence(state, instr)
+            word = instr["word"]
+            hits = [
+                (len(ent), cls)
+                for ent, cls in self.entities.items()
+                if ent in sentence and re.search(rf"(?<!\w){re.escape(word)}(?!\w)", ent)
+            ]
+            return self._choice(q["criteria"], max(hits)[1] if hits else None)
         if "attribute" in instr:
             value = self.attributes.get((span, instr["attribute"]))
             if qtype == "noul":

@@ -303,3 +303,31 @@ def test_field_only_schema_skips_span_classification():
     )
     assert doc.fields["total"].extraction_text == "$9.00" and doc.metrics.candidates == 0
     assert len(backend.calls) == 1
+
+
+LONG = "The patient has acute chronic obstructive pulmonary disease and takes metformin."
+
+
+def test_jev_span_source_finds_what_rules_miss():
+    ents = {"acute chronic obstructive pulmonary disease": "condition", "metformin": "drug"}
+    sch = tx.Schema(entities=[tx.Entity("condition", "a disease"), tx.Entity("drug", "a medicine")])
+    rules = tx.Extractor(sch, backend=FakeBackend(entities=ents)).extract(LONG)
+    assert "acute chronic obstructive pulmonary disease" not in {e.extraction_text for e in rules.extractions}
+
+    backend = FakeBackend(entities=ents)
+    jev = tx.Extractor(sch, backend=backend, span_source="jev").extract(LONG)
+    assert [(e.extraction_class, e.extraction_text) for e in jev.extractions] == [
+        ("condition", "acute chronic obstructive pulmonary disease"),
+        ("drug", "metformin"),
+    ]
+    assert jev.ungrounded() == [] and jev.extractions[0].sources == ("jev_tagger",)
+    word_questions = [q for _, qs in backend.calls for q in qs.values() if "word" in q["instructions"]]
+    assert len(word_questions) == 11  # one per word
+
+    hybrid = tx.Extractor(sch, backend=FakeBackend(entities=ents), span_source="hybrid").extract(LONG)
+    assert {e.extraction_text for e in hybrid.extractions} == set(ents)
+
+
+def test_span_source_is_validated():
+    with pytest.raises(tx.ConfigurationError):
+        tx.Extractor(schema(), backend=fake(), span_source="magic")

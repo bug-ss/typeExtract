@@ -25,6 +25,7 @@ from .questions import Answer, ChoiceTask, Question, noul, score
 from .schema import NONE, UNKNOWN, Attribute, Entity, Field, Schema
 from .text import (
     BUILTIN_PATTERNS,
+    TOKEN_RE,
     STOPWORDS,
     Candidate,
     CustomGenerator,
@@ -54,6 +55,9 @@ VERIFY_FALSE = (
 )
 _ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"]
 OVERLAP_MODES = ("none", "nested", "all")
+SPAN_SOURCES = ("rules", "jev", "hybrid")
+TAG_NONE_DESC = "Not part of a mention of any of these entity types."
+_TAG_GAP = frozenset({"", "&", "-", "–", "/", ".", ",", "'", "’"})
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
@@ -154,11 +158,15 @@ class Extractor:
         price_per_mtok: float = PRICE_PER_MTOK,
         on_error: str = "raise",
         max_concurrent_documents: int = 4,
+        span_source: str = "rules",
+        tag_threshold: float = 0.3,
     ):
         if not isinstance(schema, Schema):
             raise ConfigurationError("schema must be a typeextract.Schema (see Schema.load / from_dict)")
         if overlap not in OVERLAP_MODES:
             raise ConfigurationError(f"overlap must be one of {OVERLAP_MODES}")
+        if span_source not in SPAN_SOURCES:
+            raise ConfigurationError(f"span_source must be one of {SPAN_SOURCES}")
         if on_error not in ("raise", "skip"):
             raise ConfigurationError("on_error must be 'raise' or 'skip'")
         if min(window_chars, max_sentence_chars, max_ngram, max_candidates_per_sentence) < 1:
@@ -189,6 +197,8 @@ class Extractor:
         self.review_threshold = review_threshold
         self.field_state_chars = field_state_chars
         self.on_error = on_error
+        self.span_source = span_source
+        self.tag_threshold = tag_threshold
         self.max_concurrent_documents = max(1, max_concurrent_documents)
         self.metrics = Metrics()
         """Cumulative metrics over every document this extractor has processed."""
@@ -377,9 +387,11 @@ class _Run:
             state["following_text"] = after
         return state
 
-    def _span_instructions(self, w: Window, c: Candidate, question: str, **fields: Any) -> dict[str, Any]:
+    def _span_instructions(
+        self, w: Window, c: Candidate, question: str, name: str = "span", **fields: Any
+    ) -> dict[str, Any]:
         ref = self._ref(w, c.sentence)
-        out: dict[str, Any] = {"span": c.text, **fields, "question": question.replace("{ref}", ref)}
+        out: dict[str, Any] = {name: c.text, **fields, "question": question.replace("{ref}", ref)}
         s_start, s_end = self.sentences[c.sentence]
         sentence_text = self.text[s_start:s_end]
         positions, at = [], sentence_text.find(c.text)
@@ -397,6 +409,13 @@ class _Run:
         ex, schema, metrics = self.ex, self.schema, self.doc.metrics
         cands = [c for i in w.sentences for c in self.candidates[i]]
         state = self._state(w)
+        if schema.entities and ex.span_source != "rules":
+            tagged = await self._tag_spans(w, state)
+            if ex.span_source == "jev":
+                cands = tagged
+            else:  # hybrid: union, rules first
+                seen = {(c.start, c.end) for c in cands}
+                cands = cands + [c for c in tagged if (c.start, c.end) not in seen]
 
         # round 1: one Choice per candidate (+ one Noul per sentence and sentence label)
         tasks: list[ChoiceTask] = []
@@ -526,6 +545,57 @@ class _Run:
             d.reason = "overlap"
         self.doc.extractions.extend(kept)
         self.doc.rejected.extend(dropped)
+
+    async def _tag_spans(self, w: Window, state: dict[str, Any]) -> list[Candidate]:
+        """Let Jev find the spans: one Choice per word ("which entity type is this word part of,
+        or none?"), then runs of words tagged with the same type become candidates.
+        No capitalisation, stopword or length heuristics; costs one question per word."""
+        ex = self.ex
+        options = {e.id: None for e in self.schema.entities}
+        words: list[Candidate] = []
+        for i in w.sentences:
+            ss, se = self.sentences[i]
+            words += [Candidate(m.start(), m.end(), m.group(), i) for m in TOKEN_RE.finditer(self.text, ss, se)]
+        q = "As it is used in {ref}, which entity type in `entity_types` is `word` part of?"
+        tasks = [
+            ChoiceTask(
+                f"t{k}",
+                self._span_instructions(w, word, q, name="word"),
+                dict(options),
+                escape=(NONE, TAG_NONE_DESC),
+                max_options=ex.limits.max_choice_options,
+            )
+            for k, word in enumerate(words)
+        ]
+        await ex.run_tasks(state, tasks, {}, self.doc.metrics)
+
+        spans: dict[tuple[int, int], Candidate] = {}
+
+        def emit(run: list[Candidate], cls: str) -> None:
+            s, e = run[0].start, run[-1].end
+            for end in (e, e + 1) if self.text[e : e + 1] == "." else (e,):  # "Ltd." / "Ltd"
+                if (s, end) not in spans:
+                    spans[(s, end)] = Candidate(s, end, self.text[s:end], run[0].sentence, {"jev_tagger"}, set(), {cls}, 0)
+
+        run: list[Candidate] = []
+        run_cls: str | None = None
+        for word, task in zip(words, tasks):
+            cls = task.result if task.result and task.probability >= ex.tag_threshold else None
+            joins = (
+                run
+                and cls == run_cls
+                and word.sentence == run[-1].sentence
+                and self.text[run[-1].end : word.start].strip() in _TAG_GAP
+            )
+            if joins:
+                run.append(word)
+                continue
+            if run and run_cls:
+                emit(run, run_cls)
+            run, run_cls = ([word], cls) if cls else ([], None)
+        if run and run_cls:
+            emit(run, run_cls)
+        return sorted(spans.values(), key=lambda c: (c.start, c.end))
 
     @staticmethod
     def _attribute_question(entity: Entity, attr: Attribute) -> str:
