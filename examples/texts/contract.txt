@@ -1,0 +1,10 @@
+SERVICES AGREEMENT
+
+This Services Agreement is signed on March 3, 2026 between Acme Tecnologia Ltda. (the Client) and
+Beta Consultoria S.A. (the Provider), with Maria Souza as witness.
+
+1. The Provider shall deliver the monthly compliance reports described in Annex I.
+2. The Client shall pay the Provider a total of $180,000.00 in twelve monthly installments of
+$15,000.00, each due by the 10th day of the month.
+3. Late payments accrue a fine of 2% plus interest of 1% per month, as allowed by Law No. 10.406/2002.
+4. Either party may terminate this agreement with 30 days' written notice.

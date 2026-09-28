@@ -1,0 +1,34 @@
+description: Service agreement
+instructions: Extract the contracting parties, money amounts, rates and deadlines as written.
+min_confidence: 0.6
+
+entities:
+  - id: party
+    description: a company or person that signs or is bound by the contract, named by its proper name (not a role such as "the Client")
+    examples: [Acme Tecnologia Ltda., Beta Consultoria S.A.]
+    counter_examples: [the Client, the Provider]
+    attributes:
+      role: [client, provider, witness]
+  - id: amount
+    description: an amount of money to be paid, with its currency
+  - id: rate
+    description: an interest, fine or penalty rate
+  - id: deadline
+    description: a date or period by which something must happen
+  - id: statute
+    description: a reference to a law or regulation
+    patterns: ['\bLaw (?:No\. )?[\d.]+/\d{2,4}']
+
+sentence_labels:
+  - id: obligation
+    description: creates a duty or obligation for one of the parties
+  - id: termination
+    description: states when or how the contract can be terminated
+
+fields:
+  - id: contract_value
+    description: the total value of the contract
+    source: money
+  - id: signing_date
+    description: the date the contract was signed
+    source: date

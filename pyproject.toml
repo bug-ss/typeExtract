@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "typeextract"
+version = "0.1.0"
+description = "Grounded entity extraction with typed-decision models (TypeSafe Jev): code proposes spans, Jev decides."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.25"]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+dev = ["pytest>=7", "pyyaml>=6"]
+
+[project.scripts]
+typeextract = "typeextract.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+typeextract = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
