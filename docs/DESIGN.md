@@ -56,6 +56,12 @@ text ─► segment ─► windows ─► candidates ─► round 1: classify �
    - **Timing.** Tagging runs concurrently with classifying the code candidates (separate
      requests), and only spans the code did not propose get an extra round. A failed tagging
      request follows `on_error` without losing the code candidates.
+
+   <picture>
+     <source media="(prefers-color-scheme: dark)" srcset="assets/jev-mode-dark.svg">
+     <img src="assets/jev-mode.svg" alt="The span_source=jev flow on one sentence: per-word Nouls, regions, candidate spans, round-1 classification, verification and attributes, grounded extractions." width="100%">
+   </picture>
+
 4. **Round 1: classify.** For every candidate there is one `Choice`: *which entity type is this
    exact span a complete mention of, or `none`?* A second set of questions, one `Noul` per
    sentence and sentence label, asks *is this sentence an X?*. All of a window's questions go

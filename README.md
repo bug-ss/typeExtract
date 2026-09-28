@@ -86,6 +86,17 @@ Python 3.10+. The only runtime dependency is `httpx`.
 | `"jev"` | Jev is asked about every word: *is this word part of a mention of one of the entity types?* Tagged words form regions, and every region proposes itself and each sub-span. Typed patterns and your own `patterns` / `examples` / `terms` / custom generators still run; only the capitalisation and n-gram heuristics are switched off | Entities the heuristics can't anticipate: long lowercase phrases, punctuated citations, space-separated scripts other than English |
 | `"hybrid"` | Both | Best recall; most questions |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/jev-mode-dark.svg">
+  <img src="docs/assets/jev-mode.svg" alt="How span_source=jev works on one sentence. 1: Jev answers one yes/no question per word, is this word part of a mention. 2: code joins the tagged words into two regions, absorbing the connector and. 3: each region proposes itself, its segments and its n-grams, and the precise generators add 500 mg and 2. 4: Jev classifies all 30 candidates; four are accepted, the rest are none. 5: Jev verifies the accepted spans and answers their attributes. 6: code resolves them into grounded extractions with offsets." width="100%">
+</picture>
+
+*One window in `jev` mode. Step 3 is why a region is not a span: "…disease and type 2 diabetes"
+still yields both conditions, and "metformin 500 mg" yields "metformin" and "500 mg". The words,
+regions, candidates and offsets are computed by the library's own code
+([`examples/make_diagram.py`](examples/make_diagram.py)); the probabilities are illustrative
+stand-ins for Jev's answers.*
+
 Regions are not spans:
 - "Paris, London" or "北京上海" still yield each city.
 - "Bank of America" also yields "America", for `overlap="nested"`.
@@ -249,4 +260,5 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest            # offline; no API key needed
 python examples/quickstart.py --offline
 python examples/make_demo.py --offline   # rebuilds docs/assets/demo.gif (needs Pillow and Chrome/Chromium)
+python examples/make_diagram.py          # rebuilds docs/assets/jev-mode.svg and jev-mode-dark.svg
 ```
