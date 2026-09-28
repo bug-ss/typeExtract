@@ -5,15 +5,29 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
-from .data import load_jsonl, save_jsonl
+from .data import AnnotatedDocument, load_jsonl, save_jsonl
 from .errors import TypeExtractError
-from .extractor import Extractor, run_sync
+from .extractor import SPAN_SOURCES, Extractor, run_sync
 from .jev import DEFAULT_MODEL
 from .schema import Schema
 from .visualize import save_html
+
+
+def _write_html(docs: list[AnnotatedDocument], target: str) -> None:
+    """One document and a file target: that file. Otherwise (several documents, an existing
+    directory, or a path ending in "/"): one uniquely named file per document in that directory."""
+    out = Path(target)
+    if len(docs) == 1 and not out.is_dir() and not target.endswith(("/", "\\")):
+        save_html(docs[0], out)
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    for i, d in enumerate(docs):
+        name = re.sub(r"[^\w.-]+", "_", d.document_id or "")[:80].strip("._") or "document"
+        save_html(d, out / f"{i + 1:04d}_{name}.html")
 
 
 def _extract(args: argparse.Namespace) -> int:
@@ -35,6 +49,7 @@ def _extract(args: argparse.Namespace) -> int:
         max_cost_usd=args.max_cost,
         on_error="skip" if args.skip_errors else "raise",
         max_concurrent_documents=args.concurrency,
+        span_source=args.span_source,
     ) as ex:
         docs = ex.extract_many(inputs)
     if args.out:
@@ -43,13 +58,7 @@ def _extract(args: argparse.Namespace) -> int:
         for d in docs:
             print(json.dumps(d.to_dict(), ensure_ascii=False))
     if args.html:
-        if len(docs) == 1:
-            save_html(docs[0], args.html)
-        else:
-            out = Path(args.html)
-            out.mkdir(parents=True, exist_ok=True)
-            for i, d in enumerate(docs):
-                save_html(d, out / f"{Path(d.document_id or str(i)).stem}.html")
+        _write_html(docs, args.html)
     m = ex.metrics
     print(
         f"{len(docs)} document(s): {sum(len(d.extractions) for d in docs)} extractions, "
@@ -61,14 +70,7 @@ def _extract(args: argparse.Namespace) -> int:
 
 
 def _visualize(args: argparse.Namespace) -> int:
-    docs = list(load_jsonl(args.jsonl))
-    out = Path(args.out)
-    if len(docs) == 1:
-        save_html(docs[0], out)
-    else:
-        out.mkdir(parents=True, exist_ok=True)
-        for i, d in enumerate(docs):
-            save_html(d, out / f"{Path(d.document_id or str(i)).stem}.html")
+    _write_html(list(load_jsonl(args.jsonl)), args.out)
     return 0
 
 
@@ -104,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-cost", type=float, help="stop before spending more than this (USD)")
     p.add_argument("--concurrency", type=int, default=4, help="documents in flight")
     p.add_argument("--skip-errors", action="store_true", help="keep going when a window fails")
+    p.add_argument(
+        "--span-source",
+        choices=SPAN_SOURCES,
+        default="rules",
+        help="who proposes spans: code rules, Jev word tagging, or both",
+    )
     p.set_defaults(func=_extract)
 
     p = sub.add_parser("visualize", help="render a JSONL of annotated documents as HTML")
@@ -119,8 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
     try:
         return int(args.func(args))
-    except TypeExtractError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (TypeExtractError, OSError, json.JSONDecodeError, KeyError) as exc:  # schema/IO problems: no traceback
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
 

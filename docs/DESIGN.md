@@ -37,6 +37,25 @@ text ─► segment ─► windows ─► candidates ─► round 1: classify �
    - custom generators (a hook for spaCy, GLiNER or anything else).
 
    Candidates are de-duplicated by offsets and capped per sentence by priority.
+
+   With `span_source="jev"`, Jev finds where mentions are, and the heuristic generators (proper
+   nouns, n-grams) switch off. The precise ones (typed patterns, the schema's `patterns`,
+   `examples` and `terms`, custom generators) stay on.
+   - **The question.** One `Noul` per word: *is this word part of a mention of one of the entity
+     types?* A word is tagged when that probability is at least `tag_threshold`.
+   - **Regions.** Tagged words form regions (`text.region_candidates`). Words may be separated by
+     a little punctuation ("Paris, London", "R$ 180", "bob@acme.com"), and one untagged
+     connector between tagged words is absorbed ("Bank of America"). A region is where mentions
+     are, not a mention.
+   - **What a region proposes.** Itself, with an attached `$`/`#`/`@`/`%` and an abbreviation's
+     period ("Ltd."), plus every n-gram inside it. So list items and nested mentions stay
+     separable, and round 1 decides which span is which type.
+   - **Merging.** Tagger candidates join the same per-sentence lists as the code candidates,
+     with provenance merged into `sources`, so fields with `source="any"` see them too.
+     `"hybrid"` keeps every generator on.
+   - **Timing.** Tagging runs concurrently with classifying the code candidates (separate
+     requests), and only spans the code did not propose get an extra round. A failed tagging
+     request follows `on_error` without losing the code candidates.
 4. **Round 1: classify.** For every candidate there is one `Choice`: *which entity type is this
    exact span a complete mention of, or `none`?* A second set of questions, one `Noul` per
    sentence and sentence label, asks *is this sentence an X?*. All of a window's questions go
@@ -60,8 +79,8 @@ text ─► segment ─► windows ─► candidates ─► round 1: classify �
 | Cannot generate text, cannot find spans on its own | Candidates come from code, and Jev only chooses among them. Output is offsets into the source, so there is nothing to hallucinate and nothing to align. |
 | A `Choice` has at most 255 options | A **tournament** (`ChoiceTask`) splits options into groups of 254 plus `none`, takes each group's winner, then runs a final round. The same mechanism covers entity classes, attribute options and field candidates. |
 | A `Choice` has one winner, and its probabilities sum to 1, so several entities compete | Extraction asks *what is this span?* once per candidate, not *where is the entity?*, so any number of mentions can be found. *Where* questions are used only for single-valued fields, paired with an existence `Noul` (since a Choice always ranks something first). |
-| Cannot count and is weak with numeric positions | Never asks for an index. Spans are quoted inside structured instructions, and sentences are referenced by key (`text.S2`). A repeated span gets an explicit occurrence number and snippet. Offsets live in code. |
-| 64k tokens per request, 32k for state plus the longest question | A token estimator and **packer** split a window's questions across as many requests as needed, all with the same state. If the server still rejects a request as too large, the limits are lowered and the rejected batch is **re-packed** under them (bisected as a fallback) and retried; later requests use the lower limits. Windows keep states small. |
+| Cannot count and is weak with numeric positions | Never asks for an index. Spans are quoted inside structured instructions, and sentences are referenced by key (`text.S2`). A repeated span gets an explicit occurrence number (counted as whole words) and snippet. Offsets live in code. |
+| 64k tokens per request, 32k for state plus the longest question | A token estimator and **packer** split a window's questions across as many requests as needed, all with the same state. If the server still rejects a request as too large, the limit its message names (questions or tokens, to the value it states) is lowered and the rejected batch is **re-packed** under it (bisected as a fallback) and retried; later requests use the lower limit. Windows keep states small. |
 | Accuracy drops with large, irrelevant state ("context rot") | Small windows (about 800 characters) with bounded neighbour context. Class definitions are sent once in the state, not repeated in every question. |
 | Literal reading and generic mentions ("the Client") | `none` is defined explicitly ("generic, only part of a mention, or extra words"). Definitions carry examples and counter-examples. Accepted spans are re-checked with a class-aware verification `Noul`. |
 | Probabilities are not exact, can be over-confident, and vary run to run | Per-class thresholds, and `needs_review` from the top-2 margin and low confidence. A content-addressed answer **cache** makes reruns reproducible and free. Model versions can be pinned. |

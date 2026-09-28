@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .data import ExampleData
+from .errors import TypeExtractError
 from .text import PATTERN_KINDS
 
 NONE = "none"
@@ -18,7 +19,7 @@ RESERVED = frozenset({NONE, UNKNOWN, "any"})
 ATTRIBUTE_KINDS = ("choice", "bool", "score")
 
 
-class SchemaError(ValueError):
+class SchemaError(TypeExtractError, ValueError):
     """The schema is invalid."""
 
 
@@ -30,6 +31,29 @@ def _check_id(kind: str, value: Any) -> str:
     if len(value) > 64:
         raise SchemaError(f"{kind} id {value!r} is longer than 64 characters")
     return value.strip()
+
+
+def _check_description(owner: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SchemaError(f"{owner} needs a description")
+    return value
+
+
+def _strings(value: Any, owner: str) -> tuple[str, ...]:
+    """A list of strings; a lone string is one item (not one item per character)."""
+    if value is None:
+        return ()
+    items = (value,) if isinstance(value, str) else tuple(value)
+    if not all(isinstance(v, str) for v in items):
+        raise SchemaError(f"{owner} must be strings")
+    return items
+
+
+def _build(cls: type, data: Mapping[str, Any], where: str) -> Any:
+    try:
+        return cls(**data)
+    except TypeError as exc:  # a missing or unknown key in a dict/YAML schema
+        raise SchemaError(f"{where}: {exc}") from exc
 
 
 def _check_threshold(name: str, value: float | None) -> None:
@@ -113,8 +137,9 @@ class Entity:
 
     def __post_init__(self) -> None:
         self.id = _check_id("entity", self.id)
-        if not isinstance(self.description, str) or not self.description.strip():
-            raise SchemaError(f"entity {self.id!r} needs a description")
+        _check_description(f"entity {self.id!r}", self.description)
+        for name in ("examples", "counter_examples", "terms", "patterns"):
+            setattr(self, name, _strings(getattr(self, name), f"entity {self.id!r} {name}"))
         _check_threshold(f"entity {self.id!r} min_confidence", self.min_confidence)
         names = [a.name for a in self.attributes]
         if len(set(names)) != len(names):
@@ -142,8 +167,7 @@ class SentenceLabel:
 
     def __post_init__(self) -> None:
         self.id = _check_id("sentence label", self.id)
-        if not self.description.strip():
-            raise SchemaError(f"sentence label {self.id!r} needs a description")
+        _check_description(f"sentence label {self.id!r}", self.description)
         _check_threshold(f"sentence label {self.id!r} min_confidence", self.min_confidence)
 
 
@@ -165,8 +189,8 @@ class Field:
 
     def __post_init__(self) -> None:
         self.id = _check_id("field", self.id)
-        if not self.description.strip():
-            raise SchemaError(f"field {self.id!r} needs a description")
+        _check_description(f"field {self.id!r}", self.description)
+        self.patterns = _strings(self.patterns, f"field {self.id!r} patterns")
         self.source = (self.source,) if isinstance(self.source, str) else tuple(self.source)
         if not self.source and not self.patterns:
             raise SchemaError(f"field {self.id!r} needs a source or patterns")
@@ -245,21 +269,22 @@ class Schema:
                 desc = a.get("description")
                 if isinstance(desc, list):  # shorthand: {role: [client, provider]}
                     a["options"] = a.pop("description")
-                out.append(Attribute(**a))
+                out.append(_build(Attribute, a, f"attribute {a.get('name')!r}"))
             return out
 
         entities = []
         for e in items(data.get("entities"), "entities"):
             e["attributes"] = attributes(e.get("attributes"))
-            entities.append(Entity(**e))
+            entities.append(_build(Entity, e, f"entity {e.get('id')!r}"))
         return cls(
             entities=entities,
             description=data.get("description", ""),
             instructions=data.get("instructions", ""),
             sentence_labels=[
-                SentenceLabel(**s) for s in items(data.get("sentence_labels"), "sentence_labels")
+                _build(SentenceLabel, s, f"sentence label {s.get('id')!r}")
+                for s in items(data.get("sentence_labels"), "sentence_labels")
             ],
-            fields=[Field(**f) for f in items(data.get("fields"), "fields")],
+            fields=[_build(Field, f, f"field {f.get('id')!r}") for f in items(data.get("fields"), "fields")],
             min_confidence=data.get("min_confidence", 0.5),
         )
 

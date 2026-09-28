@@ -173,3 +173,46 @@ def test_rate_limiter_paces_requests():
         return time.perf_counter() - t0
 
     assert asyncio.run(go()) >= 0.4
+
+
+def test_too_large_rejections_say_which_limit():
+    from typeextract.jev import status_error
+
+    q = status_error(422, {"detail": [{"msg": "too many questions (at most 40 questions)"}]}, httpx.Headers())
+    assert (q.limit_kind, q.limit) == ("questions", 40)
+    t = status_error(400, {"error": "request exceeds context length (maximum 64,000 tokens)"}, httpx.Headers())
+    assert (t.limit_kind, t.limit) == ("tokens", 64000)
+    u = status_error(413, "payload too large", httpx.Headers())
+    assert u.limit_kind == "tokens" and u.limit is None
+
+
+def test_sync_calls_share_one_connection_pool(monkeypatch):
+    import typeextract as tx
+    from typeextract import jev
+
+    created = []
+
+    class CountingClient(httpx.AsyncClient):
+        def __init__(self, *a, **k):
+            created.append(1)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(jev.httpx, "AsyncClient", CountingClient)
+
+    def handler(request):
+        body = json.loads(request.content)
+        answers = {
+            k: {"type": "choice", "choice": "none", "probabilities": {o: float(o == "none") for o in q["criteria"]}}
+            if q["type"] == "choice"
+            else {"type": "noul", "noul": 0.0}
+            for k, q in body["questions"].items()
+        }
+        return httpx.Response(200, json={"model": "jev-1.13.0", "answers": answers, "usage": {"input_tokens": 10}})
+
+    b = backend(handler)
+    ex = tx.Extractor(tx.Schema(entities=[tx.Entity("person", "a person")]), backend=b)
+    for text in ["Tim Cook.", "Jeff Bezos.", "Satya Nadella."]:
+        ex.extract(text)
+    assert len(created) == 1  # one client (one TLS connection pool) for every sync call
+    ex.close()
+    assert len(b._loops) == 0  # the pool was released on close

@@ -12,6 +12,7 @@ from typing import Any
 
 from .errors import APIError
 from .jev import BackendResponse
+from .text import ORDINALS, find_occurrences
 
 _REF_RE = re.compile(r"`(text(?:\.S\d+)?)`")
 
@@ -19,7 +20,8 @@ _REF_RE = re.compile(r"`(text(?:\.S\d+)?)`")
 class FakeBackend:
     """Answers the questions typeextract asks from simple lookup tables.
 
-    * ``entities``: span text -> class id (classification and verification);
+    * ``entities``: span text -> class id (classification, verification, and word tagging: a word
+      occurrence is "part of a mention" when it falls inside one of these strings in the sentence);
     * ``attributes``: (span text, attribute name) -> value (option, bool, or score level index);
     * ``sentence_labels``: label id -> substrings; a sentence containing one carries the label;
     * ``fields``: field id -> the exact value text;
@@ -105,6 +107,19 @@ class FakeBackend:
             sentence = self._sentence(state, instr)
             subs = self.sentence_labels.get(instr["sentence_type"], [])
             return self._noul(any(s in sentence for s in subs))
+        if "word" in instr:  # span tagging: is *this occurrence* of the word inside an entity mention?
+            sentence = self._sentence(state, instr)
+            word = instr["word"]
+            positions = find_occurrences(sentence, word)
+            if not positions:
+                return self._noul(False)
+            at = positions[min(_occurrence_index(instr.get("occurrence")), len(positions) - 1)]
+            inside = any(
+                s <= at and at + len(word) <= s + len(ent)
+                for ent in self.entities
+                for s in find_occurrences(sentence, ent)
+            )
+            return self._noul(inside)
         if "attribute" in instr:
             value = self.attributes.get((span, instr["attribute"]))
             if qtype == "noul":
@@ -126,6 +141,16 @@ class FakeBackend:
             n = len(q["criteria"])
             return {"type": "score", "score": 0.0, "legend": {}, "probabilities": {str(i): float(i == 0) for i in range(n)}, "confidence": 1.0}
         return self._noul(False)
+
+
+def _occurrence_index(hint: Any) -> int:
+    """ "the second of 3 occurrences in `text`" -> 1 (the extractor's wording)."""
+    words = str(hint or "").split()
+    if len(words) > 1 and words[1] in ORDINALS:
+        return ORDINALS.index(words[1])
+    if len(words) > 1 and words[1].startswith("#") and words[1][1:].isdigit():
+        return int(words[1][1:]) - 1
+    return 0
 
 
 def failing(times: int, error: APIError) -> Callable[[int, dict[str, Any]], None]:

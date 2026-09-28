@@ -9,6 +9,7 @@ import math
 import re
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -24,18 +25,25 @@ from .jev import DEFAULT_MODEL, PRICE_PER_MTOK, Backend, JevBackend
 from .questions import Answer, ChoiceTask, Question, noul, score
 from .schema import NONE, UNKNOWN, Attribute, Entity, Field, Schema
 from .text import (
-    BUILTIN_PATTERNS,
+    PATTERN_KINDS,
     STOPWORDS,
     Candidate,
     CustomGenerator,
     Window,
+    _Collector,
+    cap_for,
     context_after,
     context_before,
+    find_occurrences,
     find_spans,
     generate_candidates,
     make_windows,
+    ordinal,
+    region_candidates,
+    sentence_tokens,
     snippet,
     split_sentences,
+    typed_spans,
 )
 
 log = logging.getLogger("typeextract")
@@ -52,8 +60,12 @@ VERIFY_FALSE = (
     "The definition does not cover it (for example a generic word, role, pronoun or label), it is "
     "only part of a mention, or it includes words that are not part of the mention."
 )
-_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"]
 OVERLAP_MODES = ("none", "nested", "all")
+SPAN_SOURCES = ("rules", "jev", "hybrid")
+TAG_TRUE = "The word is part of (or all of) a mention of one of the entity types."
+TAG_FALSE = "The word is not part of any mention of these entity types."
+CLASSIFY_Q = "Which entity type in `entity_types` is `span` exactly one complete mention of, as it is used in {ref}?"
+TAG_Q = "As it is used in {ref}, is `word` part of a mention of one of the entity types in `entity_types`?"
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
@@ -70,6 +82,33 @@ def run_sync(factory: Callable[[], Awaitable[T]]) -> T:
         return asyncio.run(main())
     with ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(asyncio.run, main()).result()
+
+
+class _LoopThread:
+    """A private event loop in a daemon thread. Every sync call of an extractor runs on it, so they
+    share one connection pool (no TLS handshake per document) and one set of limits."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, name="typeextract-loop", daemon=True)
+        self.thread.start()
+
+    def run(self, coro: Awaitable[T]) -> T:
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()  # type: ignore[arg-type]
+
+
+def _shutdown(lt: _LoopThread, backend: Backend) -> None:
+    """Release the backend's connections on the private loop, then stop it (idempotent)."""
+    if lt.loop.is_closed() or not lt.thread.is_alive():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(backend.aclose(), lt.loop).result(timeout=5)
+    except Exception:  # shutting down: nothing useful to do with the error
+        pass
+    lt.loop.call_soon_threadsafe(lt.loop.stop)
+    lt.thread.join(timeout=5)
+    if not lt.thread.is_alive():
+        lt.loop.close()
 
 
 def resolve_overlaps(
@@ -154,15 +193,29 @@ class Extractor:
         price_per_mtok: float = PRICE_PER_MTOK,
         on_error: str = "raise",
         max_concurrent_documents: int = 4,
+        span_source: str = "rules",
+        tag_threshold: float = 0.3,
     ):
         if not isinstance(schema, Schema):
             raise ConfigurationError("schema must be a typeextract.Schema (see Schema.load / from_dict)")
         if overlap not in OVERLAP_MODES:
             raise ConfigurationError(f"overlap must be one of {OVERLAP_MODES}")
+        if span_source not in SPAN_SOURCES:
+            raise ConfigurationError(f"span_source must be one of {SPAN_SOURCES}")
         if on_error not in ("raise", "skip"):
             raise ConfigurationError("on_error must be 'raise' or 'skip'")
         if min(window_chars, max_sentence_chars, max_ngram, max_candidates_per_sentence) < 1:
             raise ConfigurationError("window_chars, max_sentence_chars, max_ngram and max_candidates_per_sentence must be >= 1")
+        for name, value, low in (
+            ("tag_threshold", tag_threshold, 0.0),
+            ("verify_threshold", verify_threshold, 0.0),
+            ("review_threshold", review_threshold, 0.0),
+            ("review_margin", review_margin, 0.0),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= 1:
+                raise ConfigurationError(f"{name} must be a number between 0 and 1, got {value!r}")
+        if limits is not None and not 3 <= limits.max_choice_options <= 255:
+            raise ConfigurationError("limits.max_choice_options must be between 3 and 255")
         if isinstance(stopwords, str):
             if stopwords not in STOPWORDS:
                 raise ConfigurationError(f"unknown stopword list {stopwords!r}; use {sorted(STOPWORDS)} or a set")
@@ -189,23 +242,39 @@ class Extractor:
         self.review_threshold = review_threshold
         self.field_state_chars = field_state_chars
         self.on_error = on_error
+        self.span_source = span_source
+        self.tag_threshold = tag_threshold
         self.max_concurrent_documents = max(1, max_concurrent_documents)
         self.metrics = Metrics()
         """Cumulative metrics over every document this extractor has processed."""
         self._metrics_lock = threading.Lock()
         self._class_patterns = {e.id: e.compiled_patterns for e in schema.entities if e.compiled_patterns}
         self._gazetteers = {e.id: [*e.examples, *e.terms] for e in schema.entities if e.examples or e.terms}
+        self._class_options: dict[str, Any] = {e.id: None for e in schema.entities}
+        self._loop: _LoopThread | None = None
+        self._loop_lock = threading.Lock()
+        self._finalizer: weakref.finalize | None = None
 
     # ------------------------------------------------------------------ public API
 
     def extract(self, text: str, document_id: str | None = None) -> AnnotatedDocument:
-        return run_sync(lambda: self._closing(self.aextract(text, document_id)))
+        return self._sync(lambda: self.aextract(text, document_id))
 
     def extract_many(self, documents: Iterable[Any]) -> list[AnnotatedDocument]:
         async def collect() -> list[AnnotatedDocument]:
             return [doc async for doc in self.aextract_many(documents)]
 
-        return run_sync(lambda: self._closing(collect()))
+        return self._sync(collect)
+
+    def _sync(self, factory: Callable[[], Awaitable[T]]) -> T:
+        with self._loop_lock:
+            if self._loop is None:
+                self._loop = _LoopThread()
+                self._finalizer = weakref.finalize(self, _shutdown, self._loop, self.backend)
+            lt = self._loop
+        if threading.current_thread() is lt.thread:  # re-entrant call from our own loop
+            return run_sync(factory)
+        return lt.run(factory())
 
     async def aextract(self, text: str, document_id: str | None = None) -> AnnotatedDocument:
         if not isinstance(text, str):
@@ -241,11 +310,17 @@ class Extractor:
             for fut in pending:
                 fut.cancel()
 
-    async def aclose(self) -> None:
-        await self.backend.aclose()
+    def close(self) -> None:
+        """Release connections, the private event loop and the cache."""
+        if self._finalizer is not None:
+            self._finalizer()
         close = getattr(self.cache, "close", None)
         if close:
             close()
+
+    async def aclose(self) -> None:
+        await self.backend.aclose()
+        self.close()
 
     async def __aenter__(self) -> Extractor:
         return self
@@ -257,16 +332,7 @@ class Extractor:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        close = getattr(self.cache, "close", None)
-        if close:
-            close()
-
-    async def _closing(self, coro: Awaitable[T]) -> T:
-        # sync calls run on a short-lived loop: release its connection pool before it closes
-        try:
-            return await coro
-        finally:
-            await self.backend.aclose()
+        self.close()
 
     # ------------------------------------------------------------------ shared helpers
 
@@ -313,24 +379,56 @@ class _Run:
         self.text = doc.text
         self.sentences = split_sentences(self.text, ex.max_sentence_chars)
         self.windows = make_windows(self.sentences, ex.window_chars)
+        # "jev": Jev finds the spans, so the heuristic generators (proper nouns, n-grams) are off;
+        # the precise ones (typed patterns, the schema's patterns/examples/terms, custom) stay on.
+        self.tagging = bool(self.schema.entities) and ex.span_source != "rules"
+        heuristics = ex.span_source != "jev"
         needed = bool(self.schema.entities) or any("any" in f.source for f in self.schema.fields)
-        self.candidates = [[] for _ in self.sentences] if not needed else generate_candidates(
-            self.text,
-            self.sentences,
-            class_patterns=ex._class_patterns,
-            gazetteers=ex._gazetteers,
-            stopwords=ex.stopwords,
-            max_ngram=ex.max_ngram,
-            max_per_sentence=ex.max_candidates_per_sentence,
-            ngrams=ex.ngrams,
-            custom=ex.candidate_generators,
+        self.candidates: list[list[Candidate]] = (
+            generate_candidates(
+                self.text,
+                self.sentences,
+                class_patterns=ex._class_patterns,
+                gazetteers=ex._gazetteers,
+                stopwords=ex.stopwords,
+                max_ngram=ex.max_ngram,
+                max_per_sentence=ex.max_candidates_per_sentence,
+                proper_nouns=heuristics,
+                ngrams=heuristics and ex.ngrams,
+                custom=[self._safe_generator(g) for g in ex.candidate_generators],
+            )
+            if needed
+            else [[] for _ in self.sentences]
         )
+        self.tokens = sentence_tokens(self.text, self.sentences) if self.tagging else []
         doc.metrics.windows = len(self.windows)
-        doc.metrics.candidates = sum(len(c) for c in self.candidates)
+
+    def _safe_generator(self, gen: CustomGenerator) -> CustomGenerator:
+        """A failing user generator must not abort the batch: it follows ``on_error``."""
+        name = getattr(gen, "__name__", type(gen).__name__)
+
+        def wrapped(text: str, start: int, end: int) -> list[Any]:
+            try:
+                return [
+                    (int(it[0]), int(it[1]), str(it[2])) if len(it) > 2 and it[2] else (int(it[0]), int(it[1]))
+                    for it in gen(text, start, end)
+                ]
+            except Exception as exc:
+                if self.ex.on_error == "raise":
+                    raise ExtractionError(f"candidate generator {name!r} failed: {exc}", document=self.doc) from exc
+                if not any(err["where"] == name for err in self.doc.errors):
+                    self._record("candidates", name, exc)
+                return []
+
+        return wrapped
 
     async def execute(self) -> None:
         entity_ids = {e.id for e in self.schema.entities}
-        late = [f for f in self.schema.fields if set(f.source) & entity_ids]
+        late = [
+            f
+            for f in self.schema.fields
+            if set(f.source) & entity_ids or (self.tagging and "any" in f.source)  # needs the entity pass
+        ]
         early = [f for f in self.schema.fields if f not in late]
         await _gather(
             *(self._guard("window", f"window {w.index}", self._window(w)) for w in self.windows),
@@ -338,6 +436,10 @@ class _Run:
         )
         await _gather(*(self._guard("field", f.id, self._field(f)) for f in late))
         self.doc.extractions.sort(key=lambda e: (e.start, -e.end, e.kind, e.extraction_class))
+
+    def _record(self, stage: str, where: str, exc: BaseException) -> None:
+        log.warning("skipping %s (%s): %s", where, stage, exc)
+        self.doc.errors.append({"stage": stage, "where": where, "error": f"{type(exc).__name__}: {exc}"})
 
     async def _guard(self, stage: str, where: str, coro: Awaitable[None]) -> None:
         try:
@@ -347,8 +449,7 @@ class _Run:
         except TypeExtractError as exc:
             if self.ex.on_error == "raise":
                 raise ExtractionError(f"{where}: {exc}", document=self.doc) from exc
-            log.warning("skipping %s: %s", where, exc)
-            self.doc.errors.append({"stage": stage, "where": where, "error": f"{type(exc).__name__}: {exc}"})
+            self._record(stage, where, exc)
 
     # ------------------------------------------------------------------ windows
 
@@ -377,45 +478,36 @@ class _Run:
             state["following_text"] = after
         return state
 
-    def _span_instructions(self, w: Window, c: Candidate, question: str, **fields: Any) -> dict[str, Any]:
+    def _span_instructions(
+        self, w: Window, c: Candidate, question: str, name: str = "span", **fields: Any
+    ) -> dict[str, Any]:
         ref = self._ref(w, c.sentence)
-        out: dict[str, Any] = {"span": c.text, **fields, "question": question.replace("{ref}", ref)}
+        out: dict[str, Any] = {name: c.text, **fields, "question": question.replace("{ref}", ref)}
         s_start, s_end = self.sentences[c.sentence]
-        sentence_text = self.text[s_start:s_end]
-        positions, at = [], sentence_text.find(c.text)
-        while at != -1:
-            positions.append(s_start + at)
-            at = sentence_text.find(c.text, at + 1)
+        positions = find_occurrences(self.text, c.text, s_start, s_end)
+        if c.start not in positions:
+            positions = sorted({*positions, c.start})
         if len(positions) > 1:  # the same words appear twice: say which one, never by counting
-            n = positions.index(c.start) if c.start in positions else 0
-            ordinal = _ORDINALS[n] if n < len(_ORDINALS) else f"#{n + 1}"
-            out["occurrence"] = f"the {ordinal} of {len(positions)} occurrences in {ref}"
+            out["occurrence"] = f"the {ordinal(positions.index(c.start))} of {len(positions)} occurrences in {ref}"
             out["context"] = snippet(self.text, c.start, c.end, 25)
         return out
 
+    def _classify_tasks(self, w: Window, cands: Sequence[Candidate], prefix: str) -> list[ChoiceTask]:
+        """Round 1: one Choice per candidate, "which entity type is this exact span, or none?"."""
+        return [
+            ChoiceTask(
+                f"{prefix}{k}",
+                self._span_instructions(w, c, CLASSIFY_Q),
+                dict(self.ex._class_options),
+                escape=(NONE, NONE_DESC),
+                max_options=self.ex.limits.max_choice_options,
+            )
+            for k, c in enumerate(cands)
+        ]
+
     async def _window(self, w: Window) -> None:
         ex, schema, metrics = self.ex, self.schema, self.doc.metrics
-        cands = [c for i in w.sentences for c in self.candidates[i]]
         state = self._state(w)
-
-        # round 1: one Choice per candidate (+ one Noul per sentence and sentence label)
-        tasks: list[ChoiceTask] = []
-        if schema.entities:
-            options = {e.id: None for e in schema.entities}
-            for i, c in enumerate(cands):
-                q = (
-                    "Which entity type in `entity_types` is `span` exactly one complete mention of, "
-                    "as it is used in {ref}?"
-                )
-                tasks.append(
-                    ChoiceTask(
-                        f"c{i}",
-                        self._span_instructions(w, c, q),
-                        dict(options),
-                        escape=(NONE, NONE_DESC),
-                        max_options=ex.limits.max_choice_options,
-                    )
-                )
         label_q: dict[str, Question] = {}
         for i in w.sentences:
             for j, label in enumerate(schema.sentence_labels):
@@ -426,9 +518,25 @@ class _Run:
                         "question": f"Is {self._ref(w, i)} a `sentence_type` sentence, as described in `definition`?",
                     }
                 )
-        if not tasks and not label_q:
-            return
-        label_answers = await ex.run_tasks(state, tasks, label_q, metrics)
+
+        # Round 1. The code candidates are classified while (in "jev"/"hybrid") Jev tags words in
+        # a separate, concurrent request: no extra round trip, and a failed tagging round cannot
+        # take the code candidates' results down with it.
+        cands = [c for i in w.sentences for c in self.candidates[i]] if schema.entities else []
+        tasks = self._classify_tasks(w, cands, "c")
+        jobs: list[Awaitable[Any]] = []
+        if tasks or label_q:
+            jobs.append(ex.run_tasks(state, tasks, label_q, metrics))
+        if self.tagging:
+            jobs.append(self._tag(w, state))
+        results = await _gather(*jobs)
+        label_answers: dict[str, Answer] = results[0] if (tasks or label_q) else {}
+        if self.tagging and results[-1]:
+            new = results[-1]
+            new_tasks = self._classify_tasks(w, new, "n")
+            await ex.run_tasks(state, new_tasks, {}, metrics)
+            cands, tasks = cands + new, tasks + new_tasks
+        metrics.candidates += len(cands)
 
         for i in w.sentences:
             s, e = self.sentences[i]
@@ -527,6 +635,54 @@ class _Run:
         self.doc.extractions.extend(kept)
         self.doc.rejected.extend(dropped)
 
+    async def _tag(self, w: Window, state: dict[str, Any]) -> list[Candidate]:
+        """Let Jev find where mentions are: one Noul per word, "is this word part of a mention of
+        one of the entity types?". Tagged words form regions and each region proposes candidate
+        spans (``text.region_candidates``); round 1 then decides which span is which type.
+
+        Returns the candidates the code generators had not proposed; for those they had, it adds
+        ``jev_tagger`` to their sources. All of them are added to ``self.candidates`` so fields
+        with ``source="any"`` see them too. A failed tagging round follows ``on_error``.
+        """
+        ex = self.ex
+        words = [Candidate(s, e, self.text[s:e], i) for i in w.sentences for s, e in self.tokens[i]]
+        if not words:
+            return []
+        questions = {
+            f"t{k}": noul(self._span_instructions(w, word, TAG_Q, name="word"), true=TAG_TRUE, false=TAG_FALSE)
+            for k, word in enumerate(words)
+        }
+        try:
+            answers = await ex.asker.ask(state, questions, self.doc.metrics)
+        except FATAL_ERRORS:
+            raise
+        except TypeExtractError as exc:
+            if ex.on_error == "raise":
+                raise
+            self._record("tag", f"window {w.index}", exc)
+            return []
+
+        col = _Collector(self.text, self.sentences)
+        k = 0
+        for i in w.sentences:
+            toks = self.tokens[i]
+            inside = [(answers[f"t{k + n}"].noul or 0.0) >= ex.tag_threshold for n in range(len(toks))]
+            k += len(toks)
+            region_candidates(self.text, i, self.sentences[i], toks, inside, col, ex.stopwords, ex.max_ngram)
+
+        new: list[Candidate] = []
+        for i in w.sentences:
+            existing = {(c.start, c.end): c for c in self.candidates[i]}
+            added = []
+            for c in col.ranked(i, cap_for(self.text, self.tokens[i], ex.max_candidates_per_sentence)):
+                if (c.start, c.end) in existing:
+                    existing[(c.start, c.end)].sources.add("jev_tagger")
+                else:
+                    added.append(c)
+            self.candidates[i] = sorted([*self.candidates[i], *added], key=lambda c: (c.start, c.end))
+            new += added
+        return new
+
     @staticmethod
     def _attribute_question(entity: Entity, attr: Attribute) -> str:
         what = attr.name.replace("_", " ") + (f" ({attr.description})" if attr.description else "")
@@ -560,8 +716,8 @@ class _Run:
         for src in f.source:
             if src == "any":
                 spans.update((c.start, c.end) for cs in self.candidates for c in cs)
-            elif src in BUILTIN_PATTERNS:
-                spans.update(find_spans(self.text, [BUILTIN_PATTERNS[src]]))
+            elif src in PATTERN_KINDS:
+                spans.update((s, e) for s, e, _ in typed_spans(self.text, {src}))
             else:
                 spans.update((e.start, e.end) for e in self.doc.extractions if e.extraction_class == src)
         spans.update(find_spans(self.text, f.compiled_patterns))
@@ -594,7 +750,11 @@ class _Run:
             self.doc.fields[f.id] = None
             return
         index = {sp: i for i, sp in enumerate(spans)}
-        base: dict[str, Any] = {"document_type": self.schema.description} if self.schema.description else {}
+        base: dict[str, Any] = {}
+        if self.schema.description:
+            base["document_type"] = self.schema.description
+        if self.schema.instructions:
+            base["guidelines"] = self.schema.instructions
 
         def options(items: Sequence[tuple[int, int]]) -> dict[str, Any]:
             return {

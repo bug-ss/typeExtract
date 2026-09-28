@@ -160,12 +160,18 @@ class Asker:
             batches.append(current)
         return batches
 
-    def _learn(self, tokens: int, n_questions: int) -> None:
-        """The server rejected a request we thought was valid. We cannot tell whether tokens or the
-        question count was the problem, so both limits shrink a little (not by half: in-flight
-        batches packed under the old limit keep failing for a while and would ratchet it down)."""
-        new_tokens = max(1_000, min(self._request_tokens, int(tokens * 0.8)))
-        new_questions = max(1, min(self._max_questions, int(n_questions * 0.7)))
+    def _learn(self, tokens: int, n_questions: int, exc: RequestTooLargeError, floor: int) -> None:
+        """The server rejected a request we thought was valid: lower the limit it named (to the
+        value it stated, if any). If the message named neither, both shrink a little (not by
+        half: batches packed under the old limit keep failing for a while and would ratchet it
+        down). The token limit never drops below ``floor``, what one question needs with this state."""
+        new_tokens, new_questions = self._request_tokens, self._max_questions
+        if exc.limit_kind != "tokens":
+            target = exc.limit if exc.limit_kind == "questions" and exc.limit else int(n_questions * 0.7)
+            new_questions = max(1, min(new_questions, target, n_questions - 1))
+        if exc.limit_kind != "questions":
+            target = int(exc.limit * self.limits.safety) if exc.limit_kind == "tokens" and exc.limit else int(tokens * 0.8)
+            new_tokens = max(floor, min(new_tokens, target))
         if (new_tokens, new_questions) != (self._request_tokens, self._max_questions):
             self._request_tokens, self._max_questions = new_tokens, new_questions
             log.warning(
@@ -184,6 +190,7 @@ class Asker:
     ) -> dict[str, Answer]:
         est = state_tokens + sum(item[3] for item in batch)
         reserved = self.budget.reserve(est)
+        rejection: RequestTooLargeError | None = None
         try:
             resp = await self.backend.evaluate(state, {k: q for k, q, _, _ in batch}, self.model)
         except BaseException as exc:
@@ -191,9 +198,9 @@ class Asker:
             metrics.retries += getattr(exc, "retries", 0)
             if not isinstance(exc, RequestTooLargeError) or len(batch) == 1:
                 raise
-            resp = None
-        if resp is None:  # rejected as too large: shrink the limits and re-pack
-            self._learn(est, len(batch))
+            rejection = exc
+        if rejection is not None:  # rejected as too large: lower the named limit and re-pack
+            self._learn(est, len(batch), rejection, state_tokens + max(item[3] for item in batch))
             metrics.splits += 1
             parts = self._pack(state_tokens, batch)
             if len(parts) == 1:
@@ -222,6 +229,7 @@ class Asker:
         out: dict[str, Answer] = {}
         invalid: list[tuple[str, Question, str, int]] = []
         problems: list[str] = []
+        to_cache: list[tuple[str, dict[str, Any]]] = []
         for item in batch:
             key, q, ck, _ = item
             try:
@@ -231,8 +239,14 @@ class Asker:
                 problems.append(str(exc))
                 continue
             out[key] = ans
-            if self.cache is not None:
-                self.cache.set(ck, ans.to_dict())
+            to_cache.append((ck, ans.to_dict()))
+        if self.cache is not None and to_cache:
+            set_many = getattr(self.cache, "set_many", None)
+            if set_many is not None:
+                set_many(to_cache)
+            else:
+                for ck, value in to_cache:
+                    self.cache.set(ck, value)
         if invalid:
             if not retry_invalid:
                 raise ResponseValidationError(

@@ -3,7 +3,12 @@ import re
 import pytest
 
 from typeextract.text import (
+    _Collector,
     context_after,
+    find_occurrences,
+    region_candidates,
+    tokens,
+    typed_spans,
     context_before,
     find_spans,
     generate_candidates,
@@ -122,7 +127,7 @@ def test_typed_patterns():
         ("500 mg", "quantity"),
         ("INV-2087", "identifier"),
     ]:
-        assert kind in c[span].kinds, span
+        assert f"typed:{kind}" in c[span].sources, span
     # numbers inside more specific matches are not proposed on their own
     assert "415" not in c and "0177" not in c and "1,315.50" not in c
 
@@ -165,9 +170,9 @@ def test_gazetteer_class_patterns_and_custom_generators():
         custom=[custom],
     )
     c = {x.text: x for cs in out for x in cs}
-    assert c["Metformin"].classes == {"drug"} and c["ASPIRIN"].classes == {"drug"}
-    assert c["ZX-9"].classes == {"code"}
-    assert c["daily"].classes == {"frequency"} and "custom" in c["daily"].sources
+    assert "gazetteer:drug" in c["Metformin"].sources and "gazetteer:drug" in c["ASPIRIN"].sources
+    assert "pattern:code" in c["ZX-9"].sources
+    assert "custom:frequency" in c["daily"].sources
 
 
 def test_cjk_character_windows():
@@ -201,3 +206,57 @@ def test_wrapped_list_items_continue_but_new_paragraphs_do_not():
         "- Item two: call +1 (415) 555-0177 or email dana.whit@acme-corp.com",
         "Invoice INV-2087 follows.",
     ]
+
+
+
+# ------------------------------------------------------------------ review regressions
+
+
+def test_combining_marks_and_decomposed_accents_stay_in_one_token():
+    for text, expected in [("दिल्ली में", ["दिल्ली", "में"]), ("Mu\u0308ller GmbH", ["Mu\u0308ller", "GmbH"])]:
+        assert [text[s:e] for s, e in tokens(text)] == expected
+
+
+def test_possessives_are_not_part_of_names():
+    c = cands("Apple's CEO met Google’s team; O'Neil agreed.")
+    assert "Apple" in c and "Google" in c and "O'Neil" in c
+    assert not any("'s" in t or "’s" in t for t in c)
+
+
+def test_occurrences_are_whole_words():
+    text = "A man and a woman had a cat in Austin."
+    assert len(find_occurrences(text, "a")) == 2  # not inside "man", "woman", "had", "cat"
+    assert find_occurrences(text, "man") == [2]
+    assert find_occurrences(text, "in") == [text.index(" in ") + 1]
+    assert find_occurrences("北京上海北京", "北京") == [0, 4]  # CJK: plain substring
+
+
+def test_typed_spans_apply_kind_rules():
+    text = "Firmware 1.2.3.4 shipped March 3, 2026 with 40 units; hotline +1 415 555 0177."
+    spans = {(text[s:e], k) for s, e, k in typed_spans(text)}
+    assert ("+1 415 555 0177", "phone") in spans
+    assert not any(k == "phone" and t == "1.2.3.4" for t, k in spans)
+    assert not any(k == "number" and t in {"3", "2026", "40", "415"} for t, k in spans)
+
+
+def _regions(text, inside_words):
+    sents = split_sentences(text)
+    col = _Collector(text, sents)
+    toks = tokens(text, *sents[0])
+    region_candidates(text, 0, sents[0], toks, [text[s:e] in inside_words for s, e in toks], col, {"of", "and", "the"})
+    return {c.text for c in col.found[0].values()}
+
+
+def test_regions_keep_list_items_nested_mentions_and_symbols_separable():
+    got = _regions("We visited Paris, London, Berlin and Rome.", {"Paris", "London", "Berlin", "Rome"})
+    assert {"Paris", "London", "Berlin", "Rome"} <= got
+    got = _regions("The Bank of America office.", {"Bank", "America"})  # "of" absorbed as a connector
+    assert {"Bank of America", "America", "Bank"} <= got
+    got = _regions("It cost $1.2 billion, up 12% on R$ 180.000,00; mail bob@acme.com or #4521.",
+                   {"1.2", "billion", "12", "R", "180.000,00", "bob", "acme.com", "4521"})
+    assert {"$1.2 billion", "12%", "R$ 180.000,00", "bob@acme.com", "#4521"} <= got
+
+
+def test_regions_add_a_period_only_after_abbreviations():
+    assert "metformin." not in _regions("The patient takes metformin.", {"metformin"})
+    assert "Acme Ltd." in _regions("We hired Acme Ltd. today.", {"Acme", "Ltd"})

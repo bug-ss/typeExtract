@@ -303,3 +303,205 @@ def test_field_only_schema_skips_span_classification():
     )
     assert doc.fields["total"].extraction_text == "$9.00" and doc.metrics.candidates == 0
     assert len(backend.calls) == 1
+
+
+LONG = "The patient has acute chronic obstructive pulmonary disease and takes metformin."
+
+
+def test_jev_span_source_finds_what_rules_miss():
+    ents = {"acute chronic obstructive pulmonary disease": "condition", "metformin": "drug"}
+    sch = tx.Schema(entities=[tx.Entity("condition", "a disease"), tx.Entity("drug", "a medicine")])
+    rules = tx.Extractor(sch, backend=FakeBackend(entities=ents)).extract(LONG)
+    assert "acute chronic obstructive pulmonary disease" not in {e.extraction_text for e in rules.extractions}
+
+    backend = FakeBackend(entities=ents)
+    jev = tx.Extractor(sch, backend=backend, span_source="jev").extract(LONG)
+    assert [(e.extraction_class, e.extraction_text) for e in jev.extractions] == [
+        ("condition", "acute chronic obstructive pulmonary disease"),
+        ("drug", "metformin"),
+    ]
+    assert jev.ungrounded() == [] and jev.extractions[0].sources == ("jev_tagger",)
+    word_questions = [q for _, qs in backend.calls for q in qs.values() if "word" in q["instructions"]]
+    assert len(word_questions) == 11  # one per word
+
+    hybrid = tx.Extractor(sch, backend=FakeBackend(entities=ents), span_source="hybrid").extract(LONG)
+    assert {e.extraction_text for e in hybrid.extractions} == set(ents)
+
+
+def test_span_source_is_validated():
+    with pytest.raises(tx.ConfigurationError):
+        tx.Extractor(schema(), backend=fake(), span_source="magic")
+
+
+# ------------------------------------------------------------------ span_source review regressions
+
+GEO = tx.Schema(
+    entities=[
+        tx.Entity("location", "a named place"),
+        tx.Entity("organization", "a named company or institution"),
+        tx.Entity("amount", "an amount of money"),
+        tx.Entity("rate", "a percentage rate"),
+        tx.Entity("email", "an email address"),
+        tx.Entity("ticket", "a ticket number", patterns=[r"#\d+"]),
+        tx.Entity("drug", "a medicine", terms=["metformin"]),
+    ]
+)
+
+
+def jev_run(text, entities, mode="jev", **kw):
+    backend = FakeBackend(entities=entities)
+    return tx.Extractor(GEO, backend=backend, span_source=mode, **kw).extract(text), backend
+
+
+@pytest.mark.parametrize("mode", ["jev", "hybrid"])
+def test_tagger_keeps_list_items_separate(mode):
+    ents = {c: "location" for c in ["Paris", "London", "Berlin", "Rome", "Austin", "Texas"]}
+    doc, _ = jev_run("We visited Paris, London, Berlin and Rome, then Austin, Texas.", ents, mode)
+    assert [e.extraction_text for e in doc.extractions] == ["Paris", "London", "Berlin", "Rome", "Austin", "Texas"]
+
+
+def test_tagger_handles_table_rows_cjk_and_nesting():
+    doc, _ = jev_run("Paris   London   Berlin", {"Paris": "location", "London": "location", "Berlin": "location"})
+    assert [e.extraction_text for e in doc.extractions] == ["Paris", "London", "Berlin"]
+    doc, _ = jev_run("我们去了北京上海。", {"北京": "location", "上海": "location"})
+    assert [e.extraction_text for e in doc.extractions] == ["北京", "上海"]
+    doc, _ = jev_run("The Bank of America office.", {"Bank of America": "organization", "America": "location"}, overlap="nested")
+    assert [(e.extraction_class, e.extraction_text) for e in doc.extractions] == [
+        ("organization", "Bank of America"),
+        ("location", "America"),
+    ]
+
+
+def test_jev_mode_keeps_symbols_and_the_users_own_candidate_sources():
+    ents = {"$1.2 billion": "amount", "12%": "rate", "bob@acme.com": "email", "#4521": "ticket", "metformin": "drug"}
+    text = "It cost $1.2 billion, up 12%; mail bob@acme.com about #4521 and metformin."
+    doc, _ = jev_run(text, ents)
+    assert {e.extraction_text for e in doc.extractions} == set(ents)
+    # the ticket pattern and the drug term still propose their spans even if Jev tags nothing
+    quiet = FakeBackend(entities=ents)
+    quiet._answer = lambda state, q, _orig=quiet._answer: (
+        {"type": "noul", "noul": 0.0} if "word" in (q.get("instructions") or {}) else _orig(state, q)
+    )
+    doc = tx.Extractor(GEO, backend=quiet, span_source="jev").extract(text)
+    assert {"#4521", "metformin", "$1.2 billion", "12%", "bob@acme.com"} <= {e.extraction_text for e in doc.extractions}
+
+
+def test_no_sentence_final_period_variants():
+    doc, backend = jev_run("The patient takes metformin.", {"metformin": "drug"}, mode="hybrid")
+    assert [e.extraction_text for e in doc.extractions] == ["metformin"]
+    asked = [q["instructions"]["span"] for _, qs in backend.calls for q in qs.values() if "span" in q["instructions"]]
+    assert "metformin." not in asked
+
+
+def test_tag_threshold_is_a_recall_knob_and_is_validated():
+    class Unsure(FakeBackend):  # "is this word part of a mention?" -> 0.45 for every word
+        def _answer(self, state, q):
+            if "word" in (q.get("instructions") or {}):
+                return {"type": "noul", "noul": 0.45}
+            return super()._answer(state, q)
+
+    doc = tx.Extractor(GEO, backend=Unsure(entities={"Rome": "location"}), span_source="jev", tag_threshold=0.4).extract("I love Rome.")
+    assert [e.extraction_text for e in doc.extractions] == ["Rome"]
+    doc = tx.Extractor(GEO, backend=Unsure(entities={"Rome": "location"}), span_source="jev", tag_threshold=0.5).extract("I love Rome.")
+    assert doc.extractions == []
+    for bad in (None, -0.1, 1.5, "0.3"):
+        with pytest.raises(tx.ConfigurationError):
+            tx.Extractor(GEO, backend=FakeBackend(), span_source="jev", tag_threshold=bad)
+
+
+def test_hybrid_survives_a_failed_tagging_round():
+    def fail_tagging(_call, questions):
+        if any("word" in (q.get("instructions") or {}) for q in questions.values()):
+            raise ServerError("overloaded", 529)
+
+    backend = FakeBackend(entities={"Rome": "location", "Paris": "location"}, fail=fail_tagging)
+    doc = tx.Extractor(GEO, backend=backend, span_source="hybrid", on_error="skip").extract("Rome and Paris.")
+    assert [e.extraction_text for e in doc.extractions] == ["Rome", "Paris"]
+    assert [err["stage"] for err in doc.errors] == ["tag"]
+
+
+def test_hybrid_metrics_sources_and_any_fields():
+    sch = tx.Schema(
+        entities=[tx.Entity("condition", "a disease"), tx.Entity("drug", "a medicine")],
+        fields=[tx.Field("main_condition", "the main condition", source="any")],
+    )
+    ents = {"acute chronic obstructive pulmonary disease": "condition", "metformin": "drug"}
+    backend = FakeBackend(entities=ents, fields={"main_condition": "acute chronic obstructive pulmonary disease"})
+    doc = tx.Extractor(sch, backend=backend, span_source="hybrid").extract(LONG)
+    classified = sum(
+        1 for _, qs in backend.calls for q in qs.values()
+        if q["type"] == "choice" and "span" in q["instructions"] and "entity_type" not in q["instructions"]
+    )
+    assert doc.metrics.candidates == classified
+    by_text = {e.extraction_text: e for e in doc.extractions}
+    assert "jev_tagger" in by_text["metformin"].sources and "ngram" in by_text["metformin"].sources
+    assert doc.fields["main_condition"].extraction_text == "acute chronic obstructive pulmonary disease"
+
+
+def test_hybrid_tags_and_classifies_concurrently():
+    class Slow(FakeBackend):
+        in_flight = peak = 0
+
+        async def evaluate(self, state, questions, model):
+            Slow.in_flight += 1
+            Slow.peak = max(Slow.peak, Slow.in_flight)
+            await asyncio.sleep(0.05)
+            Slow.in_flight -= 1
+            return await super().evaluate(state, questions, model)
+
+    backend = Slow(entities={"Rome": "location"})
+    doc = tx.Extractor(GEO, backend=backend, span_source="hybrid", verify=False).extract("I love Rome.")
+    assert [e.extraction_text for e in doc.extractions] == ["Rome"]
+    assert Slow.peak == 2  # the tagging request overlapped the code candidates' classification
+
+
+def test_failing_custom_generator_follows_on_error():
+    def broken(text, start, end):
+        raise RuntimeError("spaCy model not loaded")
+
+    ex = tx.Extractor(schema(), backend=fake(), candidate_generators=[broken], on_error="skip")
+    docs = ex.extract_many(["Tim Cook.", "Apple."])
+    assert [d.extractions[0].extraction_text for d in docs] == ["Tim Cook", "Apple"]
+    assert all(d.errors == [{"stage": "candidates", "where": "broken", "error": "RuntimeError: spaCy model not loaded"}] for d in docs)
+    with pytest.raises(ExtractionError):
+        tx.Extractor(schema(), backend=fake(), candidate_generators=[broken]).extract("Tim Cook.")
+
+
+def test_fields_get_guidelines_and_typed_kind_rules():
+    sch = tx.Schema(
+        instructions="Amounts are in thousands.",
+        fields=[tx.Field("count", "the number of units", source="number")],
+    )
+    backend = FakeBackend(fields={"count": "40"})
+    doc = tx.Extractor(sch, backend=backend).extract("Shipped March 3, 2026 with 40 units.")
+    assert doc.fields["count"].extraction_text == "40"
+    state, questions = backend.calls[0]
+    assert state["guidelines"] == "Amounts are in thousands."
+    values = {o["value"] for q in questions.values() if q["type"] == "choice" for o in q["criteria"].values() if isinstance(o, dict)}
+    assert values == {"40"}  # "3" and "2026" (inside the date) are not offered
+
+
+def test_word_occurrence_hints_are_whole_words():
+    backend = FakeBackend(entities={"cat": "location"})
+    tx.Extractor(GEO, backend=backend, span_source="jev").extract("A man and a woman had a cat.")
+    hints = {
+        (q["instructions"]["word"], q["instructions"].get("occurrence"))
+        for _, qs in backend.calls for q in qs.values() if "word" in (q.get("instructions") or {})
+    }
+    assert ("man", None) in hints  # not "inside" woman
+    assert ("a", "the first of 2 occurrences in `text`") in hints and ("a", "the second of 2 occurrences in `text`") in hints
+
+
+def test_html_view_scales_to_thousands_of_extractions():
+    import time as _time
+
+    text = " ".join(f"w{i}" for i in range(4000))
+    doc = tx.AnnotatedDocument(text=text)
+    pos = 0
+    for i in range(4000):
+        word = f"w{i}"
+        doc.extractions.append(tx.Extraction("x", word, tx.CharInterval(pos, pos + len(word)), confidence=0.9))
+        pos += len(word) + 1
+    t0 = _time.perf_counter()
+    html = tx.to_html(doc)
+    assert _time.perf_counter() - t0 < 1.5 and html.count("<mark") == 4000

@@ -67,6 +67,28 @@ Python 3.10+. The only runtime dependency is `httpx`.
 6. **Fields** (single-valued slots): the field's candidates become the options of one `Choice`,
    *"which option is the contract value?"*, plus a `Noul` asking whether the text states it at all.
 
+### Who finds the spans: `span_source`
+
+| `span_source` | How candidates are found | Use when |
+|---|---|---|
+| `"rules"` (default) | The code generators above | Most documents; cheapest |
+| `"jev"` | Jev is asked about every word: *is this word part of a mention of one of the entity types?* Tagged words form regions, and every region proposes itself and each sub-span. Typed patterns and your own `patterns` / `examples` / `terms` / custom generators still run; only the capitalisation and n-gram heuristics are switched off | Entities the heuristics can't anticipate: long lowercase phrases, punctuated citations, space-separated scripts other than English |
+| `"hybrid"` | Both | Best recall; most questions |
+
+Regions are not spans:
+- "Paris, London" or "北京上海" still yield each city.
+- "Bank of America" also yields "America", for `overlap="nested"`.
+- `$`, `#`, `@` and `%` attached to a region are kept ("$1.2 billion", "12%").
+
+Every candidate then goes through the same classification and verification rounds.
+
+Tagging runs concurrently with classifying the code candidates, so it adds no sequential round
+trip; only spans the code didn't propose get one more round. A failed tagging request follows
+`on_error` without losing the code candidates. The cost is one extra question per word.
+`tag_threshold` (default 0.3) is the recall knob: a word counts as tagged when Jev gives it at
+least this probability. Scripts without spaces between words (Thai, Lao, Khmer) are not
+segmented into words.
+
 [docs/DESIGN.md](docs/DESIGN.md) has the full design and how each Jev limitation is handled.
 
 ## Handling Jev's limitations
@@ -147,6 +169,7 @@ ex = tx.Extractor(
     max_concurrent_documents=8,
 )
 docs = ex.extract_many(texts)       # ordered; also accepts {"text", "document_id"} dicts
+ex.close()                          # or use `with tx.Extractor(...) as ex:`
 print(ex.metrics)                   # cumulative requests / tokens / cost / retries / splits
 
 async for doc in ex.aextract_many(huge_iterable):   # async, bounded memory
@@ -165,9 +188,13 @@ async for doc in ex.aextract_many(huge_iterable):   # async, bounded memory
 - **Limits.** `tx.Limits(request_tokens=64_000, state_plus_question_tokens=32_000, max_questions=200)`
   controls packing. Tokens are estimated conservatively on the client (about 3 UTF-8 bytes per
   token).
-- **Safety.** A single `Extractor` can be shared between threads and used from inside a running
-  event loop (notebooks, FastAPI). Document text is only ever sent as data, never as part of an
-  instruction.
+- **Safety and connection reuse.**
+  - A single `Extractor` can be shared between threads and used from inside a running event loop
+    (notebooks, FastAPI).
+  - Sync calls run on one private background event loop, so they share a single connection pool.
+    `close()` releases it.
+  - Document text is only ever sent as data, never as part of an instruction.
+  - A failing custom generator follows `on_error` like any other failure.
 - **Recall.** Candidates bound recall: an entity no generator proposes cannot be found. For
   irregular domains, add `patterns`/`terms` to the entity or plug in a generator:
 
@@ -187,7 +214,7 @@ async for doc in ex.aextract_many(huge_iterable):   # async, bounded memory
 ## CLI
 
 ```bash
-typeextract extract docs/*.txt -s schema.yaml -o out.jsonl --html out/ --cache .cache.sqlite --max-cost 5
+typeextract extract docs/*.txt -s schema.yaml -o out.jsonl --html out/ --cache .cache.sqlite --max-cost 5 --span-source hybrid
 typeextract visualize out.jsonl -o out/
 typeextract check
 ```

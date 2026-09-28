@@ -93,3 +93,43 @@ def test_cli_reports_missing_key(monkeypatch, capsys, tmp_path):
     (tmp_path / "doc.txt").write_text("text")
     assert cli.main(["extract", str(tmp_path / "doc.txt"), "-s", str(tmp_path / "schema.json")]) == 2
     assert "TYPESAFE_API_KEY" in capsys.readouterr().err
+
+
+def test_schema_errors_are_clear_not_attribute_or_type_errors():
+    with pytest.raises(SchemaError):
+        tx.SentenceLabel("x", None)
+    with pytest.raises(SchemaError):
+        tx.Schema.from_dict({"entities": [{"id": "drug"}]})  # description missing
+    with pytest.raises(SchemaError):
+        tx.Schema.from_dict({"entities": [{"id": "drug", "description": "d", "colour": "red"}]})
+    assert tx.Entity("drug", "a medicine", examples="aspirin").examples == ("aspirin",)  # not per character
+    assert isinstance(SchemaError("x"), tx.TypeExtractError)
+
+
+def test_limits_that_cannot_finish_a_tournament_are_rejected():
+    from typeextract.questions import ChoiceTask
+
+    with pytest.raises(tx.ConfigurationError):
+        tx.Extractor(tx.Schema.from_dict(SCHEMA), backend=FakeBackend(), limits=tx.Limits(max_choice_options=2))
+    with pytest.raises(ValueError):
+        ChoiceTask("k", "?", {"a": None, "b": None, "c": None}, escape=("none", "n"), max_options=2)
+
+
+def test_cli_writes_one_html_per_document_and_reports_schema_errors(tmp_path, monkeypatch, capsys):
+    (tmp_path / "schema.json").write_text(json.dumps(SCHEMA))
+    rows = [{"text": f"Acme Ltd. pays R$ {i}.000,00."} for i in range(3)]
+    (tmp_path / "docs.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    fake = FakeBackend(entities={"Acme Ltd.": "party"})
+    monkeypatch.setattr("typeextract.extractor.JevBackend", lambda *a, **k: fake)
+    out_dir = tmp_path / "html"
+    assert cli.main(["extract", str(tmp_path / "docs.jsonl"), "-s", str(tmp_path / "schema.json"), "-o", str(tmp_path / "o.jsonl"), "--html", str(out_dir), "--span-source", "hybrid"]) == 0
+    assert len(list(out_dir.glob("*.html"))) == 3
+    assert any("word" in q["instructions"] for _, qs in fake.calls for q in qs.values() if isinstance(q["instructions"], dict))
+    # one document into an existing directory: written inside it, no IsADirectoryError
+    (tmp_path / "one.txt").write_text("Acme Ltd. pays.")
+    assert cli.main(["extract", str(tmp_path / "one.txt"), "-s", str(tmp_path / "schema.json"), "-o", str(tmp_path / "p.jsonl"), "--html", str(out_dir)]) == 0
+    assert len(list(out_dir.glob("*.html"))) == 4
+    (tmp_path / "bad.json").write_text(json.dumps({"entities": [{"id": "x"}]}))
+    assert cli.main(["extract", str(tmp_path / "one.txt"), "-s", str(tmp_path / "bad.json")]) == 2
+    err = capsys.readouterr().err
+    assert "SchemaError" in err and "Traceback" not in err
