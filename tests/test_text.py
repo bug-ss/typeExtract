@@ -260,3 +260,9 @@ def test_regions_keep_list_items_nested_mentions_and_symbols_separable():
 def test_regions_add_a_period_only_after_abbreviations():
     assert "metformin." not in _regions("The patient takes metformin.", {"metformin"})
     assert "Acme Ltd." in _regions("We hired Acme Ltd. today.", {"Acme", "Ltd"})
+
+
+def test_regions_propose_segments_between_connectors_and_punctuation():
+    words = {"acute", "chronic", "obstructive", "pulmonary", "disease", "type", "2", "diabetes"}
+    got = _regions("Admitted with acute chronic obstructive pulmonary disease and type 2 diabetes.", words)
+    assert {"acute chronic obstructive pulmonary disease", "type 2 diabetes"} <= got

@@ -633,10 +633,12 @@ def region_candidates(
 
     Consecutive tagged words form a *region*: they may be separated by a little punctuation
     ("Paris, London", "R$ 180", "bob@acme.com"), and one untagged connector between two tagged
-    words is absorbed ("Bank of America"). A region is only where mentions are, not a mention:
-    it proposes itself (with an attached "$"/"#"/"@" or "%", and an abbreviation's period) and
-    every n-gram inside it, so lists ("Paris", "London") and nested mentions ("America" inside
-    "Bank of America") remain separable. Round 1 then decides which span is which type.
+    words is absorbed ("Bank of America"). A region is only where mentions are, not a mention.
+    It proposes itself, each *segment* between its connectors and punctuation ("acute chronic
+    obstructive pulmonary disease" and "type 2 diabetes" from "... disease and type 2 diabetes"),
+    and every n-gram inside it, so lists and nested mentions ("America" inside "Bank of America")
+    stay separable. Each span keeps an attached "$"/"#"/"@" or "%", and gets an abbreviation's
+    period ("Ltd."). Round 1 then decides which span is which type.
     """
     ss, se = sentence_span
     stop = {w.lower() for w in stop}
@@ -645,11 +647,24 @@ def region_candidates(
     def gap(a: int, b: int) -> str:
         return text[toks[a][1] : toks[b][0]]
 
+    def emit(a: int, b: int) -> None:  # tokens a..b
+        raw_s, raw_e = toks[a][0], toks[b][1]
+        s, e = raw_s, raw_e
+        while s > ss and text[s - 1] in _LEAD_SYMBOLS:
+            s -= 1
+        while e < se and text[e] in _TRAIL_SYMBOLS:
+            e += 1
+        for x, y in {(s, e), (raw_s, raw_e)}:
+            col.add(x, y, "jev_tagger", 0, sentence=sentence)
+        if text[e : e + 1] == "." and keeps_period(text[toks[b][0] : toks[b][1]]):
+            col.add(s, e + 1, "jev_tagger", 0, sentence=sentence)
+
     i = 0
     while i < n:
         if not inside[i]:
             i += 1
             continue
+        segments = [[i, i]]
         j = i
         while True:
             k = j + 1
@@ -661,21 +676,18 @@ def region_candidates(
                 and _joinable_gap(gap(j, k))
                 and _joinable_gap(gap(k, k + 1))
             ):
+                segments.append([k + 1, k + 1])  # the connector itself is in no segment
                 j = k + 1
             elif k < n and inside[k] and _REGION_GAP.fullmatch(gap(j, k)):
+                if _joinable_gap(gap(j, k)):
+                    segments[-1][1] = k
+                else:  # punctuation: "Paris, London", "bob@acme.com"
+                    segments.append([k, k])
                 j = k
             else:
                 break
-        raw_s, raw_e = toks[i][0], toks[j][1]
-        s, e = raw_s, raw_e
-        while s > ss and text[s - 1] in _LEAD_SYMBOLS:
-            s -= 1
-        while e < se and text[e] in _TRAIL_SYMBOLS:
-            e += 1
-        for a, b in {(s, e), (raw_s, raw_e)}:
-            col.add(a, b, "jev_tagger", 0, sentence=sentence)
-        if text[e : e + 1] == "." and keeps_period(text[toks[j][0] : toks[j][1]]):
-            col.add(s, e + 1, "jev_tagger", 0, sentence=sentence)
+        for a, b in {(i, j), *(tuple(seg) for seg in segments)}:
+            emit(a, b)
         _ngrams(text, list(toks[i : j + 1]), stop, col, sentence, max_ngram, max_cjk_chars, "jev_tagger")
         i = j + 1
 

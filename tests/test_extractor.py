@@ -277,6 +277,7 @@ def test_io_roundtrip_and_html(tmp_path):
     assert json.loads(path.read_text())["metrics"]["requests"] == doc.metrics.requests
     html = tx.to_html(run(backend=fake(), text="<b>Tim Cook</b> & Apple"))
     assert "&lt;b&gt;" in html and "<mark" in html and "<b>Tim" not in html
+    assert '<mark data-class="person"' in html and '<tr data-class="person">' in html  # styleable per class
 
 
 def test_invalid_code_points_keep_offsets():
@@ -505,3 +506,13 @@ def test_html_view_scales_to_thousands_of_extractions():
     t0 = _time.perf_counter()
     html = tx.to_html(doc)
     assert _time.perf_counter() - t0 < 1.5 and html.count("<mark") == 4000
+
+
+@pytest.mark.parametrize("mode", ["jev", "hybrid"])
+def test_long_mentions_joined_by_a_connector_are_both_found(mode):
+    ents = {"acute chronic obstructive pulmonary disease": "condition", "type 2 diabetes": "condition"}
+    sch = tx.Schema(entities=[tx.Entity("condition", "a disease")])
+    doc = tx.Extractor(sch, backend=FakeBackend(entities=ents), span_source=mode).extract(
+        "Admitted with acute chronic obstructive pulmonary disease and type 2 diabetes."
+    )
+    assert [e.extraction_text for e in doc.extractions] == list(ents)

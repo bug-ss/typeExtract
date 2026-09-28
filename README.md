@@ -28,6 +28,17 @@ for e in doc.extractions:
 print(doc.fields["contract_value"].extraction_text)
 ```
 
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="typeextract's HTML view for a service agreement, a clinical note, business news and a Chinese sentence: extracted spans are highlighted in place, one class at a time, with a table of classes, offsets, probabilities and attributes below" width="100%">
+</p>
+
+*The HTML view (`tx.save_html`) on four documents: a contract, a clinical note in `hybrid`
+mode, news with a nested mention, and Chinese text. These frames come from the offline
+`FakeBackend`, whose answers come from lookup tables, so they show the output format, not Jev's
+accuracy (every probability reads 0.90). Run `python examples/make_demo.py` with a
+`TYPESAFE_API_KEY` to regenerate the GIF from live Jev answers, or add `--offline` to rebuild
+this version.*
+
 Why decide instead of generate:
 
 - **Grounded by construction.** `doc.text[e.start:e.end] == e.extraction_text` for every
@@ -237,4 +248,5 @@ typeextract check
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest            # offline; no API key needed
 python examples/quickstart.py --offline
+python examples/make_demo.py --offline   # rebuilds docs/assets/demo.gif (needs Pillow and Chrome/Chromium)
 ```

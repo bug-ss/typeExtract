@@ -55,7 +55,10 @@ def to_html(doc: AnnotatedDocument, title: str | None = None) -> str:
             style = f"background:{color[e.extraction_class]}33;border-bottom:2px solid {color[e.extraction_class]}"
             if e.needs_review:
                 style += ";outline:1px dashed #999"
-            chunk = f'<mark style="{style}" title="{html.escape(_tooltip(e))}">{chunk}</mark>'
+            chunk = (
+                f'<mark data-class="{html.escape(e.extraction_class)}" style="{style}" '
+                f'title="{html.escape(_tooltip(e))}">{chunk}</mark>'
+            )
         body.append(chunk)
 
     legend = "".join(
@@ -63,7 +66,8 @@ def to_html(doc: AnnotatedDocument, title: str | None = None) -> str:
         for c in classes
     )
     rows = "".join(
-        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+        '<tr data-class="{}"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+            html.escape(e.extraction_class),
             html.escape(e.extraction_class),
             html.escape(e.extraction_text if len(e.extraction_text) < 120 else e.extraction_text[:117] + "…"),
             f"{e.start}–{e.end}",
@@ -87,8 +91,8 @@ def to_html(doc: AnnotatedDocument, title: str | None = None) -> str:
 body{{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,sans-serif;margin:0;padding:24px 16px;}}
 main{{max-width:960px;margin:auto}} .text{{white-space:pre-wrap;border:1px solid var(--line);border-radius:8px;padding:16px}}
 mark{{color:inherit;border-radius:3px;padding:0 1px}} .tag{{display:inline-block;border:1px solid;border-radius:12px;padding:0 10px;margin:0 6px 6px 0;font-size:13px}}
-.muted{{color:var(--muted);font-size:13px}} table{{border-collapse:collapse;width:100%;margin-top:16px;font-size:14px}}
-td,th{{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top}}
+.muted{{color:var(--muted);font-size:13px}} table{{border-collapse:collapse;width:100%;margin-top:16px;font-size:14px;table-layout:fixed}}
+td,th{{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top;overflow-wrap:anywhere}}
 .scroll{{overflow-x:auto}}
 </style></head><body><main>
 <h1 style="font-size:20px">{html.escape(title or doc.document_id or "Extraction")}</h1>
@@ -96,7 +100,7 @@ td,th{{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;verti
 <div>{legend}</div>
 <div class="text">{"".join(body)}</div>
 {f'<h2 style="font-size:16px">Errors</h2><ul>{errors}</ul>' if errors else ""}
-<div class="scroll"><table><tr><th>class</th><th>text</th><th>offsets</th><th>p</th><th>attributes</th></tr>{rows}</table></div>
+<div class="scroll"><table><colgroup><col style="width:17%"><col style="width:43%"><col style="width:11%"><col style="width:7%"><col style="width:22%"></colgroup><tr><th>class</th><th>text</th><th>offsets</th><th>p</th><th>attributes</th></tr>{rows}</table></div>
 </main></body></html>"""
 
 
